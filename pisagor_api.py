@@ -6,6 +6,7 @@ import math
 import requests
 import threading
 import time
+import os
 from datetime import datetime
 
 app = Flask(__name__)
@@ -19,16 +20,13 @@ cache = {
     "toplam": 0
 }
 cache_lock = threading.Lock()
-
-# ─── KAP CACHE ────────────────────────────────────────────────────────
 kap_goruldu = set()
 kap_lock = threading.Lock()
 
-# ─── TELEGRAM BİLGİLERİ ───────────────────────────────────────────────
-# Bunları Railway'de environment variable olarak ayarlayacağız
-import os
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+# ─── AYARLAR ──────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # ─── BIST HİSSELERİ ───────────────────────────────────────────────────
 BIST_TUMU = [
@@ -114,7 +112,7 @@ def veri_cek(ticker):
         pass
     return None
 
-# ─── HESAPLAMA ────────────────────────────────────────────────────────
+# ─── TEKNİK GÖSTERGELER ───────────────────────────────────────────────
 def geometrik_oran():
     ucluler = [(5.0/3.0,5.0/4.0),(13.0/5.0,13.0/12.0),(17.0/8.0,17.0/15.0),(25.0/7.0,25.0/24.0)]
     log_a = sum(math.log(r[0]) for r in ucluler)/len(ucluler)
@@ -135,6 +133,21 @@ def hesapla_rsi(close, periyot=14):
     kayip = (-delta.where(delta<0,0.0)).rolling(window=periyot).mean()
     return 100-(100/(1+kazan/kayip))
 
+def hesapla_macd(close, hizli=12, yavas=26, sinyal=9):
+    ema_hizli = close.ewm(span=hizli, adjust=False).mean()
+    ema_yavas = close.ewm(span=yavas, adjust=False).mean()
+    macd_line = ema_hizli - ema_yavas
+    sinyal_line = macd_line.ewm(span=sinyal, adjust=False).mean()
+    histogram = macd_line - sinyal_line
+    return macd_line, sinyal_line, histogram
+
+def hesapla_bollinger(close, periyot=20, std_carp=2):
+    orta = close.rolling(window=periyot).mean()
+    std = close.rolling(window=periyot).std()
+    ust = orta + std_carp * std
+    alt = orta - std_carp * std
+    return ust, orta, alt
+
 def hesapla_adx(high, low, close, periyot=14):
     tr = pd.concat([high-low,(high-close.shift()).abs(),(low-close.shift()).abs()],axis=1).max(axis=1)
     atr = tr.rolling(window=periyot).mean()
@@ -145,87 +158,185 @@ def hesapla_adx(high, low, close, periyot=14):
     dx = 100*(di_p-di_m).abs()/(di_p+di_m)
     return dx.rolling(window=periyot).mean(), di_p, di_m
 
+# ─── AI YORUMU ────────────────────────────────────────────────────────
+def ai_yorum_uret(sonuc):
+    if not ANTHROPIC_KEY:
+        return None
+    try:
+        prompt = f"""Sen bir borsa analiz uzmanısın. Aşağıdaki teknik verilere bakarak {sonuc['hisse']} hissesi için 2-3 cümlelik kısa ve net bir Türkçe yorum yap. Sadece teknik göstergelere dayan, kesinlikle "al" veya "sat" tavsiyesi verme.
+
+Hisse: {sonuc['hisse']}
+Sinyal: {sonuc['sinyal']}
+Fiyat: {sonuc['fiyat']}₺
+Trend: {sonuc['trend']}
+RSI: {sonuc['rsi']}
+ADX: {sonuc['adx']}
+MACD: {sonuc.get('macd', 'N/A')}
+MACD Histogram: {sonuc.get('macd_hist', 'N/A')}
+Bollinger Üst: {sonuc.get('boll_ust', 'N/A')}
+Bollinger Alt: {sonuc.get('boll_alt', 'N/A')}
+Pisagor MA: {sonuc['pisagor_ma']}
+Üst Direnç: {sonuc['ust_direnc']}
+Alt Destek: {sonuc['alt_destek']}
+Sinyal Skoru: {sonuc['skor']}/5
+
+Sadece 2-3 cümle, Türkçe, teknik analiz yorumu:"""
+
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}]
+            },
+            timeout=15
+        )
+        if r.status_code == 200:
+            return r.json()["content"][0]["text"].strip()
+    except:
+        pass
+    return None
+
+# ─── ANALİZ ───────────────────────────────────────────────────────────
 def analiz_et(ticker, lookback=50):
     df = veri_cek(ticker)
     if df is None or len(df) < lookback+10:
         return {"hata": f"Veri yok: {ticker}", "hisse": ticker}
-    close=df["close"].squeeze().astype(float)
-    high=df["high"].squeeze().astype(float)
-    low=df["low"].squeeze().astype(float)
-    volume=df["volume"].squeeze().astype(float)
-    avg_ra,avg_rb = geometrik_oran()
+
+    close  = df["close"].squeeze().astype(float)
+    high   = df["high"].squeeze().astype(float)
+    low    = df["low"].squeeze().astype(float)
+    volume = df["volume"].squeeze().astype(float)
+
+    avg_ra, avg_rb = geometrik_oran()
     pma = pisagor_ma(close)
     atr = pd.concat([high-low,(high-close.shift()).abs(),(low-close.shift()).abs()],axis=1).max(axis=1).rolling(window=lookback).mean()
+
     b_up=pma+atr*avg_ra; b_mu=pma+atr*avg_rb; b_md=pma-atr*avg_rb; b_lo=pma-atr*avg_ra
+
     trend_up=(close>pma)&(pma>pma.shift(3))
     trend_down=(close<pma)&(pma<pma.shift(3))
-    rsi=hesapla_rsi(close); adx,dip,dim=hesapla_adx(high,low,close)
-    vol_ok=volume>volume.rolling(20).mean()*1.2
+
+    rsi = hesapla_rsi(close)
+    adx, dip, dim = hesapla_adx(high, low, close)
+    macd_line, macd_sig, macd_hist = hesapla_macd(close)
+    boll_ust, boll_mid, boll_alt = hesapla_bollinger(close)
+
+    vol_ok = volume > volume.rolling(20).mean()*1.2
     rsi_al=rsi<70; rsi_sat=rsi>35; adx_ok=adx>=18; di_bull=dip>dim; di_bear=dim>dip
+
+    # MACD ek filtre
+    macd_bull = macd_line > macd_sig
+    macd_bear = macd_line < macd_sig
+
     cross_up_mid=(close>b_md)&(close.shift()<=b_md.shift())
     cross_dn_mid=(close<b_mu)&(close.shift()>=b_mu.shift())
     cross_up_lower=(close>b_lo)&(close.shift()<=b_lo.shift())
     cross_dn_upper=(close<b_up)&(close.shift()>=b_up.shift())
-    al_sinyal=cross_up_mid&trend_up&rsi_al&adx_ok&vol_ok&di_bull
-    sat_sinyal=cross_dn_mid&trend_down&rsi_sat&adx_ok&vol_ok&di_bear
-    guclu_al=cross_up_lower&trend_up&(rsi<50)&adx_ok&vol_ok&di_bull
-    guclu_sat=cross_dn_upper&trend_down&(rsi>55)&adx_ok&vol_ok&di_bear
+
+    al_sinyal=cross_up_mid&trend_up&rsi_al&adx_ok&vol_ok&di_bull&macd_bull
+    sat_sinyal=cross_dn_mid&trend_down&rsi_sat&adx_ok&vol_ok&di_bear&macd_bear
+    guclu_al=cross_up_lower&trend_up&(rsi<50)&adx_ok&vol_ok&di_bull&macd_bull
+    guclu_sat=cross_dn_upper&trend_down&(rsi>55)&adx_ok&vol_ok&di_bear&macd_bear
+
     s=-1
     t_up=bool(trend_up.iloc[s]); t_down=bool(trend_down.iloc[s])
     trend_txt="YUKARI" if t_up else "ASAGI" if t_down else "YATAY"
-    son_fiyat=round(float(close.iloc[s]),2); son_pma=round(float(pma.iloc[s]),2)
+
+    son_fiyat=round(float(close.iloc[s]),2)
+    son_pma=round(float(pma.iloc[s]),2)
     son_b_up=round(float(b_up.iloc[s]),2); son_b_mu=round(float(b_mu.iloc[s]),2)
     son_b_md=round(float(b_md.iloc[s]),2); son_b_lo=round(float(b_lo.iloc[s]),2)
     son_rsi=round(float(rsi.iloc[s]),1); son_adx=round(float(adx.iloc[s]),1)
     son_dip=round(float(dip.iloc[s]),1); son_dim=round(float(dim.iloc[s]),1)
+    son_macd=round(float(macd_line.iloc[s]),3)
+    son_macd_sig=round(float(macd_sig.iloc[s]),3)
+    son_macd_hist=round(float(macd_hist.iloc[s]),3)
+    son_boll_ust=round(float(boll_ust.iloc[s]),2)
+    son_boll_mid=round(float(boll_mid.iloc[s]),2)
+    son_boll_alt=round(float(boll_alt.iloc[s]),2)
+
+    # Bollinger pozisyonu
+    boll_pos = "ÜST BANT" if close.iloc[s] > boll_ust.iloc[s] else \
+               "ALT BANT" if close.iloc[s] < boll_alt.iloc[s] else "ORTA BANT"
+
+    # MACD durumu
+    macd_durum = "POZİTİF ↑" if son_macd_hist > 0 else "NEGATİF ↓"
+
     sinyal_tip="BEKLE"; sinyal_guclu=False; sinyal_skor=0; tp_sev=None; sl_sev=None
+
     def skor(trend,ri,ai,vi,di):
         return int(trend)+int(bool(ri.iloc[s]))+int(bool(ai.iloc[s]))+int(bool(vi.iloc[s]))+int(bool(di.iloc[s]))
+
     if bool(guclu_al.iloc[s]):
-        sinyal_tip="AL"; sinyal_guclu=True; sinyal_skor=skor(t_up,rsi_al,adx_ok,vol_ok,di_bull)
+        sinyal_tip="AL"; sinyal_guclu=True
+        sinyal_skor=skor(t_up,rsi_al,adx_ok,vol_ok,di_bull)
         tp_sev=son_b_mu; sl_sev=round(son_b_lo*0.98,2)
     elif bool(al_sinyal.iloc[s]):
-        sinyal_tip="AL"; sinyal_skor=skor(t_up,rsi_al,adx_ok,vol_ok,di_bull)
+        sinyal_tip="AL"
+        sinyal_skor=skor(t_up,rsi_al,adx_ok,vol_ok,di_bull)
         tp_sev=son_b_mu; sl_sev=round(son_b_md*0.99,2)
     elif bool(guclu_sat.iloc[s]):
-        sinyal_tip="SAT"; sinyal_guclu=True; sinyal_skor=skor(t_down,rsi_sat,adx_ok,vol_ok,di_bear)
+        sinyal_tip="SAT"; sinyal_guclu=True
+        sinyal_skor=skor(t_down,rsi_sat,adx_ok,vol_ok,di_bear)
         tp_sev=son_b_md; sl_sev=round(son_b_up*1.02,2)
     elif bool(sat_sinyal.iloc[s]):
-        sinyal_tip="SAT"; sinyal_skor=skor(t_down,rsi_sat,adx_ok,vol_ok,di_bear)
+        sinyal_tip="SAT"
+        sinyal_skor=skor(t_down,rsi_sat,adx_ok,vol_ok,di_bear)
         tp_sev=son_b_md; sl_sev=round(son_b_mu*1.01,2)
+
     return {
         "hisse":ticker,"fiyat":son_fiyat,"sinyal":sinyal_tip,"guclu":sinyal_guclu,
         "skor":sinyal_skor,"yildiz":"★"*sinyal_skor+"☆"*(5-sinyal_skor),
-        "tp":tp_sev,"sl":sl_sev,"trend":trend_txt,"rsi":son_rsi,"adx":son_adx,
-        "di_plus":son_dip,"di_minus":son_dim,"pisagor_ma":son_pma,
-        "ust_direnc":son_b_up,"ara_ust":son_b_mu,"ara_alt":son_b_md,
-        "alt_destek":son_b_lo,"bar_sayisi":len(df)
+        "tp":tp_sev,"sl":sl_sev,"trend":trend_txt,
+        "rsi":son_rsi,"adx":son_adx,"di_plus":son_dip,"di_minus":son_dim,
+        "macd":son_macd,"macd_sinyal":son_macd_sig,"macd_hist":son_macd_hist,
+        "macd_durum":macd_durum,
+        "boll_ust":son_boll_ust,"boll_mid":son_boll_mid,"boll_alt":son_boll_alt,
+        "boll_pozisyon":boll_pos,
+        "pisagor_ma":son_pma,"ust_direnc":son_b_up,"ara_ust":son_b_mu,
+        "ara_alt":son_b_md,"alt_destek":son_b_lo,"bar_sayisi":len(df)
     }
 
-def telegram_mesaj(sonuc):
-    guclu="💪 GÜÇLÜ " if sonuc["guclu"] else ""
-    emoji="🟢" if sonuc["sinyal"]=="AL" else "🔴"
-    trend_emoji="📈" if sonuc["trend"]=="YUKARI" else "📉" if sonuc["trend"]=="ASAGI" else "➡️"
-    mesaj=f"""{emoji} *{guclu}{sonuc['sinyal']} SİNYALİ* — {sonuc['hisse']}
+# ─── TELEGRAM MESAJI ──────────────────────────────────────────────────
+def telegram_mesaj(sonuc, ai_yorum=None):
+    guclu = "💪 GÜÇLÜ " if sonuc["guclu"] else ""
+    emoji = "🟢" if sonuc["sinyal"]=="AL" else "🔴"
+    trend_emoji = "📈" if sonuc["trend"]=="YUKARI" else "📉" if sonuc["trend"]=="ASAGI" else "➡️"
+    macd_emoji = "📊↑" if sonuc.get("macd_hist",0) > 0 else "📊↓"
+
+    mesaj = f"""{emoji} *{guclu}{sonuc['sinyal']} SİNYALİ* — {sonuc['hisse']}
 {sonuc['yildiz']}
 
 💰 Fiyat: *{sonuc['fiyat']}₺*
 {trend_emoji} Trend: {sonuc['trend']}
 
 📊 *Teknik Göstergeler*
-• RSI: {sonuc['rsi']}
+• RSI: {sonuc['rsi']} {"🔥" if sonuc['rsi']<30 else "✅" if sonuc['rsi']<70 else "⚠️"}
 • ADX: {sonuc['adx']} {"✅" if sonuc['adx']>=18 else "⚠️"}
 • DI+/DI-: {sonuc['di_plus']} / {sonuc['di_minus']}
+• MACD: {sonuc.get('macd_durum','N/A')} {macd_emoji}
+• Bollinger: {sonuc.get('boll_pozisyon','N/A')}
 
 📐 *Pisagor Seviyeleri*
 • Üst Direnç: {sonuc['ust_direnc']}
 • Pisagor MA: {sonuc['pisagor_ma']}
 • Alt Destek: {sonuc['alt_destek']}"""
+
     if sonuc["tp"]:
-        mesaj+=f"\n\n🎯 *Hedef (TP)*: {sonuc['tp']}₺"
+        mesaj += f"\n\n🎯 *Hedef (TP)*: {sonuc['tp']}₺"
     if sonuc["sl"]:
-        mesaj+=f"\n🛑 *Stop (SL)*: {sonuc['sl']}₺"
-    mesaj+="\n\n⚠️ _Teknik gösterge bilgisidir, yatırım tavsiyesi değildir._"
+        mesaj += f"\n🛑 *Stop (SL)*: {sonuc['sl']}₺"
+
+    if ai_yorum:
+        mesaj += f"\n\n🤖 *AI Yorumu:*\n_{ai_yorum}_"
+
+    mesaj += "\n\n⚠️ _Teknik gösterge bilgisidir, yatırım tavsiyesi değildir._"
     return mesaj
 
 def telegram_gonder(mesaj):
@@ -260,12 +371,10 @@ def kap_bildirimleri_cek():
     return None
 
 def kap_mesaj_olustur(b):
-    hisse = ""
-    if b.get("stockCodes"):
-        hisse = ", ".join(b["stockCodes"][:3])
-    baslik = b.get("title", b.get("subject", "Açıklama"))[:150]
-    tip = b.get("disclosureType", b.get("type", ""))
-    tarih = b.get("publishDate", b.get("date", ""))
+    hisse = ", ".join(b["stockCodes"][:3]) if b.get("stockCodes") else ""
+    baslik = b.get("title", b.get("subject","Açıklama"))[:150]
+    tip = b.get("disclosureType", b.get("type",""))
+    tarih = b.get("publishDate", b.get("date",""))
     onemli = any(k in (tip+baslik).upper() for k in KAP_ONEMLI)
     emoji = "🔴" if onemli else "📋"
     mesaj = f"{emoji} *KAP BİLDİRİMİ*\n\n"
@@ -280,27 +389,24 @@ def kap_mesaj_olustur(b):
     return mesaj
 
 def arka_plan_kap():
-    """Her 15 dakikada KAP'ı kontrol et"""
     global kap_goruldu
-    time.sleep(30)  # Başlangıçta 30 sn bekle
+    time.sleep(30)
     while True:
         try:
             data = kap_bildirimleri_cek()
             if data:
-                bildirimler = data if isinstance(data, list) else data.get("content", [])
-                yeni = 0
+                bildirimler = data if isinstance(data, list) else data.get("content",[])
                 for b in bildirimler[:30]:
-                    bid = str(b.get("id", b.get("disclosureId", b.get("no", ""))))
+                    bid = str(b.get("id", b.get("disclosureId", b.get("no",""))))
                     if bid and bid not in kap_goruldu:
                         with kap_lock:
                             kap_goruldu.add(bid)
                         mesaj = kap_mesaj_olustur(b)
                         telegram_gonder(mesaj)
-                        yeni += 1
                         time.sleep(1)
-        except Exception as e:
+        except:
             pass
-        time.sleep(900)  # 15 dakika
+        time.sleep(900)
 
 # ─── ARKA PLAN TARAMA ─────────────────────────────────────────────────
 def arka_plan_tara():
@@ -308,29 +414,43 @@ def arka_plan_tara():
     while True:
         with cache_lock:
             cache["durum"]="taraniyor"; cache["taranan"]=0; cache["toplam"]=len(BIST_TUMU)
-        sinyaller=[]; hatalar=0
+
+        sinyaller = []
         for h in BIST_TUMU:
             try:
-                ticker=h+".IS"
-                sonuc=analiz_et(ticker)
-                if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE":
+                ticker = h+".IS"
+                sonuc = analiz_et(ticker)
+                if "hata" not in sonuc and sonuc["sinyal"] != "BEKLE":
+                    # AI yorumu üret (sadece güçlü sinyaller için)
+                    yorum = None
+                    if sonuc["guclu"] and ANTHROPIC_KEY:
+                        yorum = ai_yorum_uret(sonuc)
+
+                    mesaj = telegram_mesaj(sonuc, yorum)
                     sinyaller.append({
                         "hisse":h,"sinyal":sonuc["sinyal"],"guclu":sonuc["guclu"],
-                        "skor":sonuc["skor"],"fiyat":sonuc["fiyat"],"mesaj":telegram_mesaj(sonuc)
+                        "skor":sonuc["skor"],"fiyat":sonuc["fiyat"],
+                        "rsi":sonuc["rsi"],"adx":sonuc["adx"],
+                        "macd_durum":sonuc.get("macd_durum",""),
+                        "boll_pozisyon":sonuc.get("boll_pozisyon",""),
+                        "trend":sonuc["trend"],"ai_yorum":yorum,
+                        "mesaj":mesaj
                     })
-                else:
-                    hatalar+=1
             except:
-                hatalar+=1
+                pass
+
             with cache_lock:
-                cache["taranan"]+=1
+                cache["taranan"] += 1
             time.sleep(0.5)
-        sinyaller.sort(key=lambda x:x["skor"],reverse=True)
+
+        sinyaller.sort(key=lambda x: x["skor"], reverse=True)
+
         with cache_lock:
-            cache["sonuc"]=sinyaller
-            cache["guncelleme"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cache["durum"]="tamamlandi"
-            cache["taranan"]=len(BIST_TUMU)
+            cache["sonuc"] = sinyaller
+            cache["guncelleme"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cache["durum"] = "tamamlandi"
+            cache["taranan"] = len(BIST_TUMU)
+
         time.sleep(7200)
 
 # ─── ENDPOINT'LER ─────────────────────────────────────────────────────
@@ -339,15 +459,16 @@ def anasayfa():
     with cache_lock:
         d=cache["durum"]; t=cache["taranan"]; top=cache["toplam"]; g=cache["guncelleme"]
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"7.0",
+        "sistem":"Pisagor PRO API","versiyon":"8.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
+        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger Bantları","KAP Takibi","AI Yorumu"],
         "endpointler":{
-            "/tarama":"Sinyal sonuçları (anında)",
-            "/durum":"Tarama ilerleme durumu",
-            "/kap":"KAP son bildirimleri",
+            "/tarama":"Sinyal sonuçları",
+            "/durum":"Tarama durumu",
+            "/kap":"KAP bildirimleri",
             "/analiz/<ticker>":"Tek hisse analizi",
-            "/liste":"Tüm hisse listesi"
+            "/liste":"Hisse listesi"
         }
     })
 
@@ -364,7 +485,8 @@ def durum():
 @app.route("/tarama")
 def tarama():
     with cache_lock:
-        sonuc=cache["sonuc"]; g=cache["guncelleme"]; d=cache["durum"]; t=cache["taranan"]; top=cache["toplam"]
+        sonuc=cache["sonuc"]; g=cache["guncelleme"]; d=cache["durum"]
+        t=cache["taranan"]; top=cache["toplam"]
     if sonuc is None:
         return jsonify({"durum":d,"mesaj":f"Tarama devam ediyor... {t}/{top}","sinyal_sayisi":0,"sinyaller":[]})
     return jsonify({"durum":d,"son_guncelleme":g,"taranan":top,"sinyal_sayisi":len(sonuc),"sinyaller":sonuc})
@@ -378,19 +500,22 @@ def kap():
     sonuc = []
     for b in bildirimler[:20]:
         sonuc.append({
-            "id": b.get("id", b.get("disclosureId","")),
-            "hisse": b.get("stockCodes", []),
-            "baslik": b.get("title", b.get("subject","")),
-            "tip": b.get("disclosureType", b.get("type","")),
-            "tarih": b.get("publishDate", b.get("date",""))
+            "id":b.get("id",b.get("disclosureId","")),
+            "hisse":b.get("stockCodes",[]),
+            "baslik":b.get("title",b.get("subject","")),
+            "tip":b.get("disclosureType",b.get("type","")),
+            "tarih":b.get("publishDate",b.get("date",""))
         })
     return jsonify({"toplam":len(sonuc),"bildirimler":sonuc})
 
 @app.route("/analiz/<ticker>")
 def analiz(ticker):
     if not ticker.endswith(".IS"):
-        ticker=ticker+".IS"
-    return jsonify(analiz_et(ticker))
+        ticker = ticker+".IS"
+    sonuc = analiz_et(ticker)
+    if "hata" not in sonuc and sonuc["sinyal"] != "BEKLE" and ANTHROPIC_KEY:
+        sonuc["ai_yorum"] = ai_yorum_uret(sonuc)
+    return jsonify(sonuc)
 
 @app.route("/liste")
 def liste():
@@ -398,8 +523,6 @@ def liste():
 
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
-    global kap_lock
-    kap_lock = threading.Lock()
     t1 = threading.Thread(target=arka_plan_tara, daemon=True)
     t2 = threading.Thread(target=arka_plan_kap, daemon=True)
     t1.start()
