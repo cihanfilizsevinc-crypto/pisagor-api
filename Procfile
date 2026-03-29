@@ -1,1 +1,1 @@
-web: gunicorn pisagor_api:app --timeout 300 --worker-class gthread --workers 1 --threads 8
+web: gunicorn pisagor_api:app --timeout 120 --workers 1
