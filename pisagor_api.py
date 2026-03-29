@@ -153,6 +153,98 @@ def hesapla_adx(high, low, close, periyot=14):
     dx = 100*(di_p-di_m).abs()/(di_p+di_m)
     return dx.rolling(window=periyot).mean(), di_p, di_m
 
+# ─── TAKAS & YABANCI VERİSİ ───────────────────────────────────────────
+def takas_cek(hisse_kodu):
+    """Birden fazla kaynaktan takas verisi çek"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+
+    # Kaynak 1: BIST resmi API
+    try:
+        url = f"https://www.borsaistanbul.com/api/data/equity/investor?symbol={hisse_kodu}"
+        r = requests.get(url, headers={**headers, "Referer": "https://www.borsaistanbul.com/"}, timeout=10)
+        if r.status_code == 200 and r.json():
+            data = r.json()
+            return parse_takas_bist(data, hisse_kodu)
+    except:
+        pass
+
+    # Kaynak 2: İş Yatırım
+    try:
+        url = f"https://www.isyatirim.com.tr/api/data/takas/{hisse_kodu}"
+        r = requests.get(url, headers={**headers, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
+        if r.status_code == 200:
+            return parse_takas_isyatirim(r.json(), hisse_kodu)
+    except:
+        pass
+
+    # Kaynak 3: Yahoo Finance institutional holders
+    try:
+        ticker = yf.Ticker(f"{hisse_kodu}.IS")
+        info = ticker.info
+        if info:
+            held_pct = info.get("heldPercentInstitutions", None)
+            if held_pct is not None:
+                return {
+                    "hisse": hisse_kodu,
+                    "kaynak": "yahoo",
+                    "kurumsal_oran": round(held_pct * 100, 2),
+                    "yabanci_oran": None,
+                    "net_yabanci": None,
+                    "durum": "VERİ YOK",
+                }
+    except:
+        pass
+
+    return None
+
+def parse_takas_bist(data, hisse_kodu):
+    try:
+        if isinstance(data, list):
+            son = data[-1]
+        else:
+            son = data
+        yabanci = float(son.get("foreignRatio", son.get("yabanci", 0)))
+        net = float(son.get("netForeign", son.get("net", 0)))
+        return {
+            "hisse": hisse_kodu, "kaynak": "BIST",
+            "yabanci_oran": round(yabanci, 2),
+            "yerli_oran": round(100-yabanci, 2),
+            "net_yabanci": round(net, 0),
+            "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR",
+            "tarih": son.get("date", datetime.now().strftime("%Y-%m-%d"))
+        }
+    except:
+        return None
+
+def parse_takas_isyatirim(data, hisse_kodu):
+    try:
+        yabanci = float(data.get("yabanci", data.get("foreignRatio", 0)))
+        net = float(data.get("net", data.get("netForeign", 0)))
+        return {
+            "hisse": hisse_kodu, "kaynak": "isyatirim",
+            "yabanci_oran": round(yabanci, 2),
+            "yerli_oran": round(100-yabanci, 2),
+            "net_yabanci": round(net, 0),
+            "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR",
+            "tarih": data.get("tarih", datetime.now().strftime("%Y-%m-%d"))
+        }
+    except:
+        return None
+
+def takas_mesaj_ekle(takas):
+    if not takas:
+        return ""
+    durum_emoji = "🟢" if takas.get("durum")=="ALICI" else "🔴" if takas.get("durum")=="SATICI" else "⚪"
+    mesaj = f"\n\n💱 *Takas & Yabancı*"
+    if takas.get("yabanci_oran") is not None:
+        mesaj += f"\n• Yabancı: %{takas['yabanci_oran']}"
+    if takas.get("net_yabanci") is not None:
+        mesaj += f"\n• {durum_emoji} Net: {takas['net_yabanci']:+,.0f} lot ({takas.get('durum','')})"
+    return mesaj
+
 # ─── HABER DUYGU ANALİZİ ──────────────────────────────────────────────
 def haber_cek(hisse_kodu, max_haber=5):
     try:
@@ -166,10 +258,7 @@ def haber_cek(hisse_kodu, max_haber=5):
                 baslik = item.find("title")
                 tarih = item.find("pubDate")
                 if baslik is not None and baslik.text:
-                    haberler.append({
-                        "baslik": baslik.text,
-                        "tarih": tarih.text if tarih is not None else ""
-                    })
+                    haberler.append({"baslik": baslik.text, "tarih": tarih.text if tarih is not None else ""})
             return haberler
     except:
         pass
@@ -182,7 +271,7 @@ def duygu_analizi(hisse_kodu, haberler):
     prompt = f"""{hisse_kodu} hissesi haberleri:
 {haber_metni}
 
-Sadece şu formatta cevap ver (başka hiçbir şey yazma):
+Sadece şu formatta cevap ver:
 DUYGU: [POZİTİF/NEGATİF/NÖTR]
 PUAN: [-10 ile +10 arası sayı]
 ÖZET: [tek cümle Türkçe özet]"""
@@ -196,16 +285,14 @@ PUAN: [-10 ile +10 arası sayı]
         )
         if r.status_code == 200:
             yanit = r.json()["content"][0]["text"].strip()
-            duygu = "NÖTR"; puan = 0; ozet = ""
+            duygu="NÖTR"; puan=0; ozet=""
             for satir in yanit.split("\n"):
-                if "DUYGU:" in satir:
-                    duygu = satir.split("DUYGU:")[-1].strip()
+                if "DUYGU:" in satir: duygu=satir.split("DUYGU:")[-1].strip()
                 elif "PUAN:" in satir:
-                    try: puan = int(satir.split("PUAN:")[-1].strip())
-                    except: puan = 0
-                elif "ÖZET:" in satir:
-                    ozet = satir.split("ÖZET:")[-1].strip()
-            return {"duygu": duygu, "puan": puan, "ozet": ozet, "haber_sayisi": len(haberler)}
+                    try: puan=int(satir.split("PUAN:")[-1].strip())
+                    except: puan=0
+                elif "ÖZET:" in satir: ozet=satir.split("ÖZET:")[-1].strip()
+            return {"duygu":duygu,"puan":puan,"ozet":ozet,"haber_sayisi":len(haberler)}
     except:
         pass
     return None
@@ -216,7 +303,6 @@ def ai_yorum(sonuc):
         return None
     try:
         prompt = f"""Borsa analisti olarak {sonuc['hisse']} için 2 cümle teknik yorum yaz. Türkçe. Kesin tavsiye verme.
-
 RSI:{sonuc['rsi']} ADX:{sonuc['adx']} MACD:{sonuc.get('macd_durum','')} Bollinger:{sonuc.get('boll_pozisyon','')} Trend:{sonuc['trend']} Skor:{sonuc['skor']}/5"""
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -240,9 +326,9 @@ def analiz_et(ticker, lookback=50):
     high=df["high"].squeeze().astype(float)
     low=df["low"].squeeze().astype(float)
     volume=df["volume"].squeeze().astype(float)
-    avg_ra,avg_rb = geometrik_oran()
-    pma = pisagor_ma(close)
-    atr = pd.concat([high-low,(high-close.shift()).abs(),(low-close.shift()).abs()],axis=1).max(axis=1).rolling(window=lookback).mean()
+    avg_ra,avg_rb=geometrik_oran()
+    pma=pisagor_ma(close)
+    atr=pd.concat([high-low,(high-close.shift()).abs(),(low-close.shift()).abs()],axis=1).max(axis=1).rolling(window=lookback).mean()
     b_up=pma+atr*avg_ra; b_mu=pma+atr*avg_rb; b_md=pma-atr*avg_rb; b_lo=pma-atr*avg_ra
     trend_up=(close>pma)&(pma>pma.shift(3))
     trend_down=(close<pma)&(pma<pma.shift(3))
@@ -268,10 +354,8 @@ def analiz_et(ticker, lookback=50):
     son_b_md=round(float(b_md.iloc[s]),2); son_b_lo=round(float(b_lo.iloc[s]),2)
     son_rsi=round(float(rsi.iloc[s]),1); son_adx=round(float(adx.iloc[s]),1)
     son_dip=round(float(dip.iloc[s]),1); son_dim=round(float(dim.iloc[s]),1)
-    son_macd=round(float(macd_line.iloc[s]),3)
     son_macd_hist=round(float(macd_hist.iloc[s]),3)
-    son_boll_ust=round(float(boll_ust.iloc[s]),2)
-    son_boll_alt=round(float(boll_alt.iloc[s]),2)
+    son_boll_ust=round(float(boll_ust.iloc[s]),2); son_boll_alt=round(float(boll_alt.iloc[s]),2)
     boll_pos="ÜST BANT" if close.iloc[s]>boll_ust.iloc[s] else "ALT BANT" if close.iloc[s]<boll_alt.iloc[s] else "ORTA BANT"
     macd_durum="POZİTİF ↑" if son_macd_hist>0 else "NEGATİF ↓"
     sinyal_tip="BEKLE"; sinyal_guclu=False; sinyal_skor=0; tp_sev=None; sl_sev=None
@@ -294,14 +378,14 @@ def analiz_et(ticker, lookback=50):
         "skor":sinyal_skor,"yildiz":"★"*sinyal_skor+"☆"*(5-sinyal_skor),
         "tp":tp_sev,"sl":sl_sev,"trend":trend_txt,
         "rsi":son_rsi,"adx":son_adx,"di_plus":son_dip,"di_minus":son_dim,
-        "macd":son_macd,"macd_hist":son_macd_hist,"macd_durum":macd_durum,
+        "macd_hist":son_macd_hist,"macd_durum":macd_durum,
         "boll_ust":son_boll_ust,"boll_alt":son_boll_alt,"boll_pozisyon":boll_pos,
         "pisagor_ma":son_pma,"ust_direnc":son_b_up,"ara_ust":son_b_mu,
         "ara_alt":son_b_md,"alt_destek":son_b_lo,"bar_sayisi":len(df)
     }
 
 # ─── TELEGRAM MESAJI ──────────────────────────────────────────────────
-def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None):
+def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None, takas=None):
     guclu="💪 GÜÇLÜ " if sonuc["guclu"] else ""
     emoji="🟢" if sonuc["sinyal"]=="AL" else "🔴"
     trend_emoji="📈" if sonuc["trend"]=="YUKARI" else "📉" if sonuc["trend"]=="ASAGI" else "➡️"
@@ -330,14 +414,23 @@ def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None):
     if sonuc["sl"]:
         mesaj+=f"\n🛑 *Stop (SL)*: {sonuc['sl']}₺"
 
-    # Haber duygu analizi
+    # Takas verisi
+    if takas:
+        durum_emoji="🟢" if takas.get("durum")=="ALICI" else "🔴" if takas.get("durum")=="SATICI" else "⚪"
+        mesaj+=f"\n\n💱 *Takas & Yabancı*"
+        if takas.get("yabanci_oran") is not None:
+            mesaj+=f"\n• Yabancı: %{takas['yabanci_oran']}"
+        if takas.get("net_yabanci") is not None:
+            mesaj+=f"\n• {durum_emoji} Net: {takas['net_yabanci']:+,.0f} lot ({takas.get('durum','')})"
+
+    # Haber duygu
     if haber_analizi:
-        duygu_emoji = "✅" if haber_analizi["puan"]>3 else "⚠️" if haber_analizi["puan"]<-3 else "➡️"
+        duygu_emoji="✅" if haber_analizi["puan"]>3 else "⚠️" if haber_analizi["puan"]<-3 else "➡️"
         mesaj+=f"\n\n📰 *Haber Duygusu*: {haber_analizi['duygu']} {duygu_emoji} ({haber_analizi['puan']:+d})"
         if haber_analizi.get("ozet"):
             mesaj+=f"\n_{haber_analizi['ozet']}_"
 
-    # AI teknik yorum
+    # AI yorum
     if ai_yorum_metni:
         mesaj+=f"\n\n🤖 *AI Yorumu:*\n_{ai_yorum_metni}_"
 
@@ -348,7 +441,7 @@ def telegram_gonder(mesaj):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     try:
-        r = requests.post(
+        r=requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={"chat_id":TELEGRAM_CHAT_ID,"text":mesaj,"parse_mode":"Markdown"},
             timeout=10
@@ -416,17 +509,18 @@ def arka_plan_tara():
                 ticker=h+".IS"
                 sonuc=analiz_et(ticker)
                 if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE":
-                    # Haber analizi (sadece güçlü sinyaller için)
-                    haber_sonuc=None
-                    ai_yorum_metni=None
+                    haber_sonuc=None; ai_yorum_metni=None; takas_sonuc=None
                     if sonuc["guclu"]:
+                        # Takas verisi
+                        takas_sonuc=takas_cek(h)
+                        # Haber analizi
                         haberler=haber_cek(h)
                         if haberler:
                             haber_sonuc=duygu_analizi(h, haberler)
+                        # AI yorum
                         ai_yorum_metni=ai_yorum(sonuc)
-                        time.sleep(1)  # AI çağrıları arası bekleme
-
-                    mesaj=telegram_mesaj(sonuc, ai_yorum_metni, haber_sonuc)
+                        time.sleep(1)
+                    mesaj=telegram_mesaj(sonuc, ai_yorum_metni, haber_sonuc, takas_sonuc)
                     sinyaller.append({
                         "hisse":h,"sinyal":sonuc["sinyal"],"guclu":sonuc["guclu"],
                         "skor":sonuc["skor"],"fiyat":sonuc["fiyat"],
@@ -434,6 +528,7 @@ def arka_plan_tara():
                         "macd_durum":sonuc.get("macd_durum",""),
                         "boll_pozisyon":sonuc.get("boll_pozisyon",""),
                         "trend":sonuc["trend"],
+                        "takas":takas_sonuc,
                         "haber_duygu":haber_sonuc,
                         "ai_yorum":ai_yorum_metni,
                         "mesaj":mesaj
@@ -443,7 +538,6 @@ def arka_plan_tara():
             with cache_lock:
                 cache["taranan"]+=1
             time.sleep(0.5)
-
         sinyaller.sort(key=lambda x:x["skor"],reverse=True)
         with cache_lock:
             cache["sonuc"]=sinyaller
@@ -458,16 +552,17 @@ def anasayfa():
     with cache_lock:
         d=cache["durum"]; t=cache["taranan"]; top=cache["toplam"]; g=cache["guncelleme"]
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"9.0",
+        "sistem":"Pisagor PRO API","versiyon":"10.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
-        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger","KAP Takibi","AI Yorumu","Haber Duygu Analizi"],
+        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger","KAP Takibi","AI Yorumu","Haber Duygu","Takas & Yabancı"],
         "endpointler":{
             "/tarama":"Sinyal sonuçları",
             "/durum":"Tarama durumu",
             "/kap":"KAP bildirimleri",
-            "/haber/<ticker>":"Hisse haber analizi",
-            "/analiz/<ticker>":"Tek hisse analizi",
+            "/haber/<ticker>":"Haber duygu analizi",
+            "/takas/<ticker>":"Takas & yabancı verisi",
+            "/analiz/<ticker>":"Tam hisse analizi",
             "/liste":"Hisse listesi"
         }
     })
@@ -489,6 +584,13 @@ def tarama():
     if sonuc is None:
         return jsonify({"durum":d,"mesaj":f"Tarama devam ediyor... {t}/{top}","sinyal_sayisi":0,"sinyaller":[]})
     return jsonify({"durum":d,"son_guncelleme":g,"taranan":top,"sinyal_sayisi":len(sonuc),"sinyaller":sonuc})
+
+@app.route("/takas/<ticker>")
+def takas(ticker):
+    sonuc=takas_cek(ticker.upper())
+    if not sonuc:
+        return jsonify({"hata":"Takas verisi bulunamadı","ticker":ticker})
+    return jsonify(sonuc)
 
 @app.route("/haber/<ticker>")
 def haber(ticker):
@@ -513,11 +615,12 @@ def kap():
 def analiz(ticker):
     if not ticker.endswith(".IS"):
         ticker=ticker+".IS"
+    h=ticker.replace(".IS","")
     sonuc=analiz_et(ticker)
     if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE" and ANTHROPIC_KEY:
-        h=ticker.replace(".IS","")
         haberler=haber_cek(h)
-        sonuc["haber_analizi"]=duygu_analizi(h, haberler) if haberler else None
+        sonuc["haber_analizi"]=duygu_analizi(h,haberler) if haberler else None
+        sonuc["takas"]=takas_cek(h)
         sonuc["ai_yorum"]=ai_yorum(sonuc)
     return jsonify(sonuc)
 
