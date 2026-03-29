@@ -9,6 +9,7 @@ import time
 import os
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import re
 import io
 
 app = Flask(__name__)
@@ -19,6 +20,10 @@ cache = {
     "durum": "bekleniyor", "taranan": 0, "toplam": 0
 }
 cache_lock = threading.Lock()
+
+# ─── DİNAMİK HİSSE LİSTESİ CACHE ─────────────────────────────────────
+liste_cache = {"hisseler": None, "guncelleme": None}
+liste_lock = threading.Lock()
 sektor_cache = {"sonuc": None, "guncelleme": None}
 sektor_lock = threading.Lock()
 korelasyon_cache = {}
@@ -607,7 +612,7 @@ def arka_plan_tara():
         with cache_lock:
             cache["durum"]="taraniyor"; cache["taranan"]=0; cache["toplam"]=len(BIST_TUMU)
         sinyaller=[]
-        for h in BIST_TUMU:
+        for h in guncel_liste():
             try:
                 ticker=h+".IS"; sonuc=analiz_et(ticker)
                 if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE":
@@ -650,7 +655,7 @@ def anasayfa():
     with sektor_lock:
         sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"12.0",
+        "sistem":"Pisagor PRO API","versiyon":"13.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
         "sektor_guncelleme":sg,
@@ -750,14 +755,123 @@ def analiz(ticker):
 
 @app.route("/liste")
 def liste():
-    return jsonify({"toplam":len(BIST_TUMU),"hisseler":BIST_TUMU,"sektorler":SEKTORLER})
+    with liste_lock:
+        aktif_liste = liste_cache["hisseler"] or BIST_TUMU
+        guncelleme = liste_cache["guncelleme"] or "Statik liste"
+    return jsonify({
+        "toplam": len(aktif_liste),
+        "hisseler": aktif_liste,
+        "sektorler": SEKTORLER,
+        "liste_guncelleme": guncelleme
+    })
+
+# ─── DİNAMİK LİSTE GÜNCELLEME ────────────────────────────────────────
+def bist_liste_cek():
+    """BIST'ten güncel hisse listesi çek"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/html",
+    }
+
+    # Kaynak 1: Borsa İstanbul resmi API
+    try:
+        r = requests.get(
+            "https://www.borsaistanbul.com/api/data/equity/stock-list",
+            headers={**headers, "Referer": "https://www.borsaistanbul.com/"},
+            timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json()
+            hisseler = []
+            for item in (data if isinstance(data, list) else data.get("data", [])):
+                kod = item.get("symbol", item.get("code", item.get("ticker", "")))
+                if kod:
+                    hisseler.append(kod.replace(".IS","").strip().upper())
+            if len(hisseler) > 200:
+                return sorted(set(hisseler))
+    except:
+        pass
+
+    # Kaynak 2: İş Yatırım
+    try:
+        r = requests.get(
+            "https://www.isyatirim.com.tr/api/hisseler/liste",
+            headers={**headers, "X-Requested-With": "XMLHttpRequest"},
+            timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json()
+            hisseler = []
+            items = data if isinstance(data, list) else data.get("data", data.get("result", []))
+            for item in items:
+                kod = item.get("kod", item.get("symbol", item.get("hisse", "")))
+                if kod and 2 <= len(kod) <= 7:
+                    hisseler.append(kod.upper().replace(".IS",""))
+            if len(hisseler) > 200:
+                return sorted(set(hisseler))
+    except:
+        pass
+
+    # Kaynak 3: Yahoo Finance BIST hisse arama
+    try:
+        bulunan = set()
+        harfler = ["A","B","C","D","E","F","G","H","I","K","L","M","N","O","P","R","S","T","U","V","Y","Z"]
+        for harf in harfler:
+            try:
+                r = requests.get(
+                    f"https://query1.finance.yahoo.com/v1/finance/search",
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    params={"q": harf, "quotesCount": 20, "newsCount": 0, "region": "TR"},
+                    timeout=8
+                )
+                if r.status_code == 200:
+                    for q in r.json().get("quotes", []):
+                        sym = q.get("symbol", "")
+                        if sym.endswith(".IS") and q.get("quoteType") == "EQUITY":
+                            bulunan.add(sym.replace(".IS",""))
+                time.sleep(0.2)
+            except:
+                pass
+        if len(bulunan) > 200:
+            return sorted(bulunan)
+    except:
+        pass
+
+    return None
+
+def guncel_liste():
+    """Cache'deki aktif listeyi döndür, yoksa BIST_TUMU"""
+    with liste_lock:
+        return liste_cache["hisseler"] or BIST_TUMU
+
+def arka_plan_liste_guncelle():
+    """Her gün sabah 08:00'de listeyi güncelle"""
+    time.sleep(120)  # 2 dakika bekle, sistem oturulsun
+    while True:
+        try:
+            yeni_liste = bist_liste_cek()
+            if yeni_liste and len(yeni_liste) > len(BIST_TUMU):
+                with liste_lock:
+                    liste_cache["hisseler"] = yeni_liste
+                    liste_cache["guncelleme"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Telegram'a bildir
+                telegram_gonder(
+                    f"📋 *Hisse Listesi Güncellendi*\n"
+                    f"Önceki: {len(BIST_TUMU)} hisse\n"
+                    f"Yeni: {len(yeni_liste)} hisse ✅"
+                )
+        except:
+            pass
+        # Her 24 saatte bir güncelle
+        time.sleep(86400)
 
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
     t2=threading.Thread(target=arka_plan_kap, daemon=True)
     t3=threading.Thread(target=arka_plan_sektor, daemon=True)
-    t1.start(); t2.start(); t3.start()
+    t4=threading.Thread(target=arka_plan_liste_guncelle, daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start()
 
 if __name__=="__main__":
     baslat()
