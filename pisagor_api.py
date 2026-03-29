@@ -32,6 +32,8 @@ korku_cache = {"endeks": None, "seviye": None, "guncelleme": None}
 korku_lock = threading.Lock()
 sosyal_cache = {}
 sosyal_lock = threading.Lock()
+manipulasyon_cache = {"tespitler": [], "guncelleme": None}
+manipulasyon_lock = threading.Lock()
 sektor_cache = {"sonuc": None, "guncelleme": None}
 sektor_lock = threading.Lock()
 korelasyon_cache = {}
@@ -663,7 +665,7 @@ def anasayfa():
     with sektor_lock:
         sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"17.0",
+        "sistem":"Pisagor PRO API","versiyon":"18.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
         "sektor_guncelleme":sg,
@@ -1711,6 +1713,220 @@ def sosyal_ozet():
     sonuclar.sort(key=lambda x: x["toplam_skor"], reverse=True)
     return jsonify({"analiz_sayisi": len(sonuclar), "sonuclar": sonuclar})
 
+# ─── MANİPÜLASYON DEDEKTÖRü ──────────────────────────────────────────
+MANIPULASYON_ESIK = {
+    "fiyat_spike": 7,       # %7+ tek günde fiyat artışı
+    "hacim_carpan": 4,      # 4x+ hacim anomalisi
+    "pump_dump_gun": 3,     # 3 gün içinde pump & dump
+    "ani_dusus": -8,        # %-8 tek günde düşüş
+    "kap_yokken": 5,        # KAP açıklaması yokken %5+ hareket
+}
+
+def kap_son_bildirim_var_mi(hisse_kodu, gun=1):
+    """Son N günde hisse için KAP bildirimi var mı?"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json",
+                   "Referer": "https://www.kap.org.tr/"}
+        r = requests.get("https://www.kap.org.tr/tr/api/disclosures",
+                        headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            bildirimler = data if isinstance(data, list) else data.get("content", [])
+            for b in bildirimler[:50]:
+                kodlar = b.get("stockCodes", [])
+                if hisse_kodu in kodlar:
+                    return True
+    except:
+        pass
+    return False
+
+def manipulasyon_analiz(ticker, df):
+    """Manipülasyon şüphesi analizi"""
+    try:
+        close  = df["close"].squeeze().astype(float)
+        volume = df["volume"].squeeze().astype(float)
+        high   = df["high"].squeeze().astype(float)
+        low    = df["low"].squeeze().astype(float)
+
+        if len(df) < 10:
+            return None
+
+        hisse = ticker.replace(".IS", "")
+        tespitler = []
+        risk_skoru = 0
+
+        # 1. ANİ FİYAT SPIKE — tek günde %7+ artış
+        son_degisim = float((close.iloc[-1] / close.iloc[-2] - 1) * 100)
+        if son_degisim >= MANIPULASYON_ESIK["fiyat_spike"]:
+            ort_hacim = float(volume.rolling(20).mean().iloc[-1])
+            hacim_carpan = float(volume.iloc[-1] / ort_hacim) if ort_hacim > 0 else 0
+            tespitler.append({
+                "tip": "ANİ FİYAT ARTIŞI",
+                "detay": f"Tek günde %{son_degisim:.1f} artış",
+                "risk": "YÜKSEK" if hacim_carpan > 3 else "ORTA"
+            })
+            risk_skoru += 30 if hacim_carpan > 3 else 15
+
+        # 2. PUMP & DUMP — 3-5 günde sert yükseliş sonrası düşüş
+        if len(close) >= 5:
+            en_yuksek = float(close.tail(5).max())
+            en_yuksek_gun = close.tail(5).idxmax()
+            simdi = float(close.iloc[-1])
+            zirve_sonrasi = (simdi / en_yuksek - 1) * 100
+            zirve_oncesi = (en_yuksek / float(close.iloc[-6]) - 1) * 100 if len(close) >= 6 else 0
+
+            if zirve_oncesi > 15 and zirve_sonrasi < -8:
+                tespitler.append({
+                    "tip": "PUMP & DUMP ŞÜPHESİ",
+                    "detay": f"Zirveye %{zirve_oncesi:.1f} çıktı, şimdi %{abs(zirve_sonrasi):.1f} düştü",
+                    "risk": "ÇOK YÜKSEK"
+                })
+                risk_skoru += 50
+
+        # 3. OLAĞANDIŞI YÜKSEK HACIM + KÜÇÜK FİYAT (wash trading)
+        ort_hacim = float(volume.rolling(20).mean().iloc[-1])
+        son_hacim = float(volume.iloc[-1])
+        hacim_carpan = son_hacim / ort_hacim if ort_hacim > 0 else 0
+
+        if hacim_carpan >= 5 and abs(son_degisim) < 1:
+            tespitler.append({
+                "tip": "WASH TRADING ŞÜPHESİ",
+                "detay": f"Hacim {hacim_carpan:.1f}x normal ama fiyat sabit (%{son_degisim:.1f})",
+                "risk": "YÜKSEK"
+            })
+            risk_skoru += 35
+
+        # 4. KAP AÇIKLAMASI YOKKEN BÜYÜK HAREKET
+        if abs(son_degisim) >= MANIPULASYON_ESIK["kap_yokken"]:
+            kap_var = kap_son_bildirim_var_mi(hisse)
+            if not kap_var:
+                tespitler.append({
+                    "tip": "KAP AÇIKLAMASI OLMADAN BÜYÜK HAREKET",
+                    "detay": f"KAP bildirimi olmadan %{son_degisim:.1f} hareket",
+                    "risk": "YÜKSEK"
+                })
+                risk_skoru += 40
+
+        # 5. DÜŞÜK PİYASA DEĞERİ + YÜKSEK HAREKET (küçük hisseler)
+        if len(close) >= 20:
+            ort_fiyat = float(close.tail(20).mean())
+            if ort_fiyat < 20 and abs(son_degisim) > 10:
+                tespitler.append({
+                    "tip": "DÜŞÜK FİYATLI HİSSE ANOMALİSİ",
+                    "detay": f"Düşük fiyatlı hissede %{son_degisim:.1f} ani hareket",
+                    "risk": "ORTA"
+                })
+                risk_skoru += 20
+
+        if not tespitler or risk_skoru < 20:
+            return None
+
+        # Risk seviyesi
+        if risk_skoru >= 60:
+            risk_seviye = "ÇOK YÜKSEK"
+            risk_emoji = "🚨🚨"
+        elif risk_skoru >= 40:
+            risk_seviye = "YÜKSEK"
+            risk_emoji = "🚨"
+        else:
+            risk_seviye = "ORTA"
+            risk_emoji = "⚠️"
+
+        return {
+            "hisse": hisse,
+            "risk_skoru": risk_skoru,
+            "risk_seviyesi": risk_seviye,
+            "risk_emoji": risk_emoji,
+            "fiyat": round(float(close.iloc[-1]), 2),
+            "gunluk_degisim": round(son_degisim, 2),
+            "hacim_carpan": round(hacim_carpan, 1),
+            "tespitler": tespitler,
+            "tarih": str(df.index[-1].date())
+        }
+    except:
+        return None
+
+def manipulasyon_telegram_mesaj(tespit):
+    """Manipülasyon tespiti Telegram mesajı"""
+    mesaj = f"""{tespit['risk_emoji']} *MANİPÜLASYON ŞÜPHESİ*
+Risk Skoru: *{tespit['risk_skoru']}/100* — {tespit['risk_seviyesi']}
+
+🏢 *{tespit['hisse']}*
+💰 Fiyat: {tespit['fiyat']}₺ ({tespit['gunluk_degisim']:+.1f}%)
+📊 Hacim: {tespit['hacim_carpan']}x normal
+
+🔍 *Tespit Edilen Anomaliler:*"""
+
+    for t in tespit["tespitler"]:
+        risk_emoji = "🔴" if t["risk"] == "ÇOK YÜKSEK" else "🟠" if t["risk"] == "YÜKSEK" else "🟡"
+        mesaj += f"\n{risk_emoji} {t['tip']}\n   _{t['detay']}_"
+
+    mesaj += "\n\n⚠️ _Bu bir şüphe uyarısıdır. Kesin manipülasyon iddiası değildir. Yatırım tavsiyesi değildir._"
+    return mesaj
+
+def arka_plan_manipulasyon():
+    """Her saat manipülasyon tespiti yap"""
+    time.sleep(180)
+    while True:
+        try:
+            tespitler = []
+            liste = guncel_liste()
+
+            for h in liste:
+                try:
+                    ticker = h + ".IS"
+                    df = veri_cek(ticker)
+                    if df is not None and len(df) > 10:
+                        sonuc = manipulasyon_analiz(ticker, df)
+                        if sonuc:
+                            tespitler.append(sonuc)
+                            # Yüksek riskli ise hemen Telegram'a gönder
+                            if sonuc["risk_skoru"] >= 40:
+                                mesaj = manipulasyon_telegram_mesaj(sonuc)
+                                telegram_gonder(mesaj)
+                                time.sleep(2)
+                    time.sleep(0.3)
+                except:
+                    pass
+
+            tespitler.sort(key=lambda x: x["risk_skoru"], reverse=True)
+            with manipulasyon_lock:
+                manipulasyon_cache["tespitler"] = tespitler
+                manipulasyon_cache["guncelleme"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        except:
+            pass
+        time.sleep(3600)
+
+@app.route("/manipulasyon")
+def manipulasyon():
+    """Son manipülasyon tespitleri"""
+    with manipulasyon_lock:
+        tespitler = manipulasyon_cache["tespitler"]
+        guncelleme = manipulasyon_cache["guncelleme"]
+
+    if not tespitler:
+        return jsonify({"mesaj": "Henüz analiz tamamlanmadı veya tespit yok"})
+
+    return jsonify({
+        "guncelleme": guncelleme,
+        "tespit_sayisi": len(tespitler),
+        "yuksek_risk": len([t for t in tespitler if t["risk_skoru"] >= 40]),
+        "tespitler": tespitler[:20]
+    })
+
+@app.route("/manipulasyon/<ticker>")
+def manipulasyon_hisse(ticker):
+    """Tek hisse manipülasyon analizi"""
+    h = ticker.upper()
+    df = veri_cek(h + ".IS")
+    if df is None:
+        return jsonify({"hata": "Veri çekilemedi", "ticker": h})
+    sonuc = manipulasyon_analiz(h + ".IS", df)
+    if not sonuc:
+        return jsonify({"tespit": False, "mesaj": "Anormal bir durum tespit edilmedi", "ticker": h})
+    return jsonify(sonuc)
+
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
@@ -1721,7 +1937,9 @@ def baslat():
     t6=threading.Thread(target=arka_plan_akilli_para, daemon=True)
     t7=threading.Thread(target=arka_plan_korku, daemon=True)
     t8=threading.Thread(target=arka_plan_sosyal, daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start(); t5.start(); t6.start(); t7.start(); t8.start()
+    t9=threading.Thread(target=arka_plan_manipulasyon, daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start(); t5.start()
+    t6.start(); t7.start(); t8.start(); t9.start()
 
 if __name__=="__main__":
     baslat()
