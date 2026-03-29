@@ -9,6 +9,7 @@ import time
 import os
 import xml.etree.ElementTree as ET
 from datetime import datetime
+import io
 
 app = Flask(__name__)
 
@@ -20,6 +21,8 @@ cache = {
 cache_lock = threading.Lock()
 kap_goruldu = set()
 kap_lock = threading.Lock()
+rapor_cache = {}  # Analiz edilmiş raporları cache'le
+rapor_cache_lock = threading.Lock()
 
 # ─── AYARLAR ──────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -153,103 +156,195 @@ def hesapla_adx(high, low, close, periyot=14):
     dx = 100*(di_p-di_m).abs()/(di_p+di_m)
     return dx.rolling(window=periyot).mean(), di_p, di_m
 
-# ─── TAKAS & YABANCI VERİSİ ───────────────────────────────────────────
-def takas_cek(hisse_kodu):
-    """Birden fazla kaynaktan takas verisi çek"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
+# ─── FİNANSAL RAPOR ANALİZİ ──────────────────────────────────────────
+def kap_rapor_listesi(hisse_kodu):
+    """KAP'tan şirketin son finansal raporlarını çek"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Referer": "https://www.kap.org.tr/"
+        }
+        # Şirkete ait bildirimler
+        url = f"https://www.kap.org.tr/tr/api/disclosures/stock/{hisse_kodu}"
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            raporlar = []
+            bildirimler = data if isinstance(data, list) else data.get("content", [])
+            for b in bildirimler:
+                tip = b.get("disclosureType", b.get("type", "")).upper()
+                if any(k in tip for k in ["MALİ", "FİNANS", "RAPOR", "FINANCIAL", "ANNUAL", "QUARTER"]):
+                    raporlar.append({
+                        "id": b.get("id", b.get("disclosureId", "")),
+                        "baslik": b.get("title", b.get("subject", "")),
+                        "tip": tip,
+                        "tarih": b.get("publishDate", b.get("date", "")),
+                        "pdf_url": b.get("pdfUrl", b.get("documentUrl", ""))
+                    })
+            return raporlar[:5]
+    except:
+        pass
 
-    # Kaynak 1: BIST resmi API
+    # Alternatif: Genel bildirimlerden filtrele
+    try:
+        url = "https://www.kap.org.tr/tr/api/disclosures"
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.kap.org.tr/"}
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            bildirimler = data if isinstance(data, list) else data.get("content", [])
+            raporlar = []
+            for b in bildirimler:
+                kodlar = b.get("stockCodes", [])
+                if hisse_kodu in kodlar:
+                    tip = b.get("disclosureType", "").upper()
+                    if any(k in tip for k in ["MALİ", "FİNANS", "RAPOR"]):
+                        raporlar.append({
+                            "id": b.get("id", ""),
+                            "baslik": b.get("title", ""),
+                            "tip": tip,
+                            "tarih": b.get("publishDate", ""),
+                            "pdf_url": b.get("pdfUrl", "")
+                        })
+            return raporlar[:3]
+    except:
+        pass
+
+    return []
+
+def pdf_metni_cek(pdf_url):
+    """PDF'den metin çıkar"""
+    if not pdf_url:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(pdf_url, headers=headers, timeout=30)
+        if r.status_code == 200 and len(r.content) > 1000:
+            try:
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+                    metin = ""
+                    for sayfa in pdf.pages[:5]:  # İlk 5 sayfa yeterli
+                        metin += sayfa.extract_text() or ""
+                    return metin[:3000] if metin else None
+            except:
+                pass
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(io.BytesIO(r.content))
+                metin = ""
+                for sayfa in reader.pages[:5]:
+                    metin += sayfa.extract_text() or ""
+                return metin[:3000] if metin else None
+            except:
+                pass
+    except:
+        pass
+    return None
+
+def rapor_ai_analiz(hisse_kodu, rapor_metni, rapor_baslik):
+    """AI ile finansal raporu analiz et"""
+    if not rapor_metni or not ANTHROPIC_KEY:
+        return None
+
+    with rapor_cache_lock:
+        cache_key = f"{hisse_kodu}_{rapor_baslik[:50]}"
+        if cache_key in rapor_cache:
+            return rapor_cache[cache_key]
+
+    prompt = f"""Sen bir finans analistisin. {hisse_kodu} şirketinin aşağıdaki finansal raporunu analiz et.
+
+Rapor: {rapor_baslik}
+
+İçerik:
+{rapor_metni[:2000]}
+
+Şu formatta kısa analiz yap (her madde 1 satır):
+NET KAR: [rakam ve değişim]
+CİRO: [rakam ve değişim]
+BORÇ DURUMU: [düşük/orta/yüksek ve açıklama]
+ÖNEMLI: [en önemli 1-2 bilgi]
+GENEL: [POZİTİF/NEGATİF/NÖTR - tek cümle neden]"""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=20
+        )
+        if r.status_code == 200:
+            sonuc = {
+                "analiz": r.json()["content"][0]["text"].strip(),
+                "rapor": rapor_baslik,
+                "tarih": datetime.now().strftime("%Y-%m-%d")
+            }
+            with rapor_cache_lock:
+                rapor_cache[cache_key] = sonuc
+            return sonuc
+    except:
+        pass
+    return None
+
+def finansal_rapor_analiz(hisse_kodu):
+    """Hisse için son finansal raporu bul ve analiz et"""
+    with rapor_cache_lock:
+        if hisse_kodu in rapor_cache:
+            return rapor_cache[hisse_kodu]
+
+    raporlar = kap_rapor_listesi(hisse_kodu)
+    if not raporlar:
+        return None
+
+    # İlk raporu dene
+    for rapor in raporlar:
+        if rapor.get("pdf_url"):
+            metin = pdf_metni_cek(rapor["pdf_url"])
+            if metin:
+                return rapor_ai_analiz(hisse_kodu, metin, rapor["baslik"])
+
+    return None
+
+def rapor_telegram_mesaj(analiz):
+    if not analiz or not analiz.get("analiz"):
+        return ""
+    return f"\n\n📊 *Finansal Rapor AI Analizi*\n_{analiz['rapor'][:60]}_\n{analiz['analiz']}"
+
+# ─── TAKAS & YABANCI ──────────────────────────────────────────────────
+def takas_cek(hisse_kodu):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)","Accept": "application/json"}
     try:
         url = f"https://www.borsaistanbul.com/api/data/equity/investor?symbol={hisse_kodu}"
         r = requests.get(url, headers={**headers, "Referer": "https://www.borsaistanbul.com/"}, timeout=10)
         if r.status_code == 200 and r.json():
             data = r.json()
-            return parse_takas_bist(data, hisse_kodu)
+            son = data[-1] if isinstance(data, list) else data
+            yabanci = float(son.get("foreignRatio", son.get("yabanci", 0)))
+            net = float(son.get("netForeign", son.get("net", 0)))
+            return {
+                "hisse": hisse_kodu, "kaynak": "BIST",
+                "yabanci_oran": round(yabanci, 2), "yerli_oran": round(100-yabanci, 2),
+                "net_yabanci": round(net, 0),
+                "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR"
+            }
     except:
         pass
-
-    # Kaynak 2: İş Yatırım
-    try:
-        url = f"https://www.isyatirim.com.tr/api/data/takas/{hisse_kodu}"
-        r = requests.get(url, headers={**headers, "X-Requested-With": "XMLHttpRequest"}, timeout=10)
-        if r.status_code == 200:
-            return parse_takas_isyatirim(r.json(), hisse_kodu)
-    except:
-        pass
-
-    # Kaynak 3: Yahoo Finance institutional holders
     try:
         ticker = yf.Ticker(f"{hisse_kodu}.IS")
         info = ticker.info
-        if info:
-            held_pct = info.get("heldPercentInstitutions", None)
-            if held_pct is not None:
-                return {
-                    "hisse": hisse_kodu,
-                    "kaynak": "yahoo",
-                    "kurumsal_oran": round(held_pct * 100, 2),
-                    "yabanci_oran": None,
-                    "net_yabanci": None,
-                    "durum": "VERİ YOK",
-                }
+        held = info.get("heldPercentInstitutions")
+        if held:
+            return {"hisse": hisse_kodu, "kaynak": "yahoo", "kurumsal_oran": round(held*100, 2)}
     except:
         pass
-
     return None
 
-def parse_takas_bist(data, hisse_kodu):
-    try:
-        if isinstance(data, list):
-            son = data[-1]
-        else:
-            son = data
-        yabanci = float(son.get("foreignRatio", son.get("yabanci", 0)))
-        net = float(son.get("netForeign", son.get("net", 0)))
-        return {
-            "hisse": hisse_kodu, "kaynak": "BIST",
-            "yabanci_oran": round(yabanci, 2),
-            "yerli_oran": round(100-yabanci, 2),
-            "net_yabanci": round(net, 0),
-            "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR",
-            "tarih": son.get("date", datetime.now().strftime("%Y-%m-%d"))
-        }
-    except:
-        return None
-
-def parse_takas_isyatirim(data, hisse_kodu):
-    try:
-        yabanci = float(data.get("yabanci", data.get("foreignRatio", 0)))
-        net = float(data.get("net", data.get("netForeign", 0)))
-        return {
-            "hisse": hisse_kodu, "kaynak": "isyatirim",
-            "yabanci_oran": round(yabanci, 2),
-            "yerli_oran": round(100-yabanci, 2),
-            "net_yabanci": round(net, 0),
-            "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR",
-            "tarih": data.get("tarih", datetime.now().strftime("%Y-%m-%d"))
-        }
-    except:
-        return None
-
-def takas_mesaj_ekle(takas):
-    if not takas:
-        return ""
-    durum_emoji = "🟢" if takas.get("durum")=="ALICI" else "🔴" if takas.get("durum")=="SATICI" else "⚪"
-    mesaj = f"\n\n💱 *Takas & Yabancı*"
-    if takas.get("yabanci_oran") is not None:
-        mesaj += f"\n• Yabancı: %{takas['yabanci_oran']}"
-    if takas.get("net_yabanci") is not None:
-        mesaj += f"\n• {durum_emoji} Net: {takas['net_yabanci']:+,.0f} lot ({takas.get('durum','')})"
-    return mesaj
-
-# ─── HABER DUYGU ANALİZİ ──────────────────────────────────────────────
+# ─── HABER DUYGU ──────────────────────────────────────────────────────
 def haber_cek(hisse_kodu, max_haber=5):
     try:
-        arama = f"{hisse_kodu} hisse borsa"
-        url = f"https://news.google.com/rss/search?q={arama}&hl=tr&gl=TR&ceid=TR:tr"
+        url = f"https://news.google.com/rss/search?q={hisse_kodu}+hisse+borsa&hl=tr&gl=TR&ceid=TR:tr"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         if r.status_code == 200:
             root = ET.fromstring(r.content)
@@ -268,19 +363,12 @@ def duygu_analizi(hisse_kodu, haberler):
     if not haberler or not ANTHROPIC_KEY:
         return None
     haber_metni = "\n".join([f"- {h['baslik']}" for h in haberler[:5]])
-    prompt = f"""{hisse_kodu} hissesi haberleri:
-{haber_metni}
-
-Sadece şu formatta cevap ver:
-DUYGU: [POZİTİF/NEGATİF/NÖTR]
-PUAN: [-10 ile +10 arası sayı]
-ÖZET: [tek cümle Türkçe özet]"""
+    prompt = f"""{hisse_kodu} haberleri:\n{haber_metni}\n\nSadece:\nDUYGU: [POZİTİF/NEGATİF/NÖTR]\nPUAN: [-10/+10]\nÖZET: [tek cümle]"""
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 100,
-                  "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 100, "messages": [{"role": "user", "content": prompt}]},
             timeout=15
         )
         if r.status_code == 200:
@@ -297,18 +385,16 @@ PUAN: [-10 ile +10 arası sayı]
         pass
     return None
 
-# ─── AI TEKNİK YORUM ──────────────────────────────────────────────────
 def ai_yorum(sonuc):
     if not ANTHROPIC_KEY:
         return None
     try:
-        prompt = f"""Borsa analisti olarak {sonuc['hisse']} için 2 cümle teknik yorum yaz. Türkçe. Kesin tavsiye verme.
-RSI:{sonuc['rsi']} ADX:{sonuc['adx']} MACD:{sonuc.get('macd_durum','')} Bollinger:{sonuc.get('boll_pozisyon','')} Trend:{sonuc['trend']} Skor:{sonuc['skor']}/5"""
+        prompt = f"""Borsa analisti: {sonuc['hisse']} için 2 cümle teknik yorum. Türkçe. Tavsiye verme.
+RSI:{sonuc['rsi']} ADX:{sonuc['adx']} MACD:{sonuc.get('macd_durum','')} Bollinger:{sonuc.get('boll_pozisyon','')} Trend:{sonuc['trend']}"""
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150,
-                  "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
             timeout=15
         )
         if r.status_code == 200:
@@ -322,26 +408,19 @@ def analiz_et(ticker, lookback=50):
     df = veri_cek(ticker)
     if df is None or len(df) < lookback+10:
         return {"hata": f"Veri yok: {ticker}", "hisse": ticker}
-    close=df["close"].squeeze().astype(float)
-    high=df["high"].squeeze().astype(float)
-    low=df["low"].squeeze().astype(float)
-    volume=df["volume"].squeeze().astype(float)
-    avg_ra,avg_rb=geometrik_oran()
-    pma=pisagor_ma(close)
+    close=df["close"].squeeze().astype(float); high=df["high"].squeeze().astype(float)
+    low=df["low"].squeeze().astype(float); volume=df["volume"].squeeze().astype(float)
+    avg_ra,avg_rb=geometrik_oran(); pma=pisagor_ma(close)
     atr=pd.concat([high-low,(high-close.shift()).abs(),(low-close.shift()).abs()],axis=1).max(axis=1).rolling(window=lookback).mean()
     b_up=pma+atr*avg_ra; b_mu=pma+atr*avg_rb; b_md=pma-atr*avg_rb; b_lo=pma-atr*avg_ra
-    trend_up=(close>pma)&(pma>pma.shift(3))
-    trend_down=(close<pma)&(pma<pma.shift(3))
+    trend_up=(close>pma)&(pma>pma.shift(3)); trend_down=(close<pma)&(pma<pma.shift(3))
     rsi=hesapla_rsi(close); adx,dip,dim=hesapla_adx(high,low,close)
-    macd_line,macd_sig,macd_hist=hesapla_macd(close)
-    boll_ust,boll_mid,boll_alt=hesapla_bollinger(close)
+    macd_line,macd_sig,macd_hist=hesapla_macd(close); boll_ust,boll_mid,boll_alt=hesapla_bollinger(close)
     vol_ok=volume>volume.rolling(20).mean()*1.2
     rsi_al=rsi<70; rsi_sat=rsi>35; adx_ok=adx>=18; di_bull=dip>dim; di_bear=dim>dip
     macd_bull=macd_line>macd_sig; macd_bear=macd_line<macd_sig
-    cross_up_mid=(close>b_md)&(close.shift()<=b_md.shift())
-    cross_dn_mid=(close<b_mu)&(close.shift()>=b_mu.shift())
-    cross_up_lower=(close>b_lo)&(close.shift()<=b_lo.shift())
-    cross_dn_upper=(close<b_up)&(close.shift()>=b_up.shift())
+    cross_up_mid=(close>b_md)&(close.shift()<=b_md.shift()); cross_dn_mid=(close<b_mu)&(close.shift()>=b_mu.shift())
+    cross_up_lower=(close>b_lo)&(close.shift()<=b_lo.shift()); cross_dn_upper=(close<b_up)&(close.shift()>=b_up.shift())
     al_sinyal=cross_up_mid&trend_up&rsi_al&adx_ok&vol_ok&di_bull&macd_bull
     sat_sinyal=cross_dn_mid&trend_down&rsi_sat&adx_ok&vol_ok&di_bear&macd_bear
     guclu_al=cross_up_lower&trend_up&(rsi<50)&adx_ok&vol_ok&di_bull&macd_bull
@@ -384,13 +463,12 @@ def analiz_et(ticker, lookback=50):
         "ara_alt":son_b_md,"alt_destek":son_b_lo,"bar_sayisi":len(df)
     }
 
-# ─── TELEGRAM MESAJI ──────────────────────────────────────────────────
-def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None, takas=None):
+# ─── TELEGRAM ─────────────────────────────────────────────────────────
+def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None, takas=None, rapor_analizi=None):
     guclu="💪 GÜÇLÜ " if sonuc["guclu"] else ""
     emoji="🟢" if sonuc["sinyal"]=="AL" else "🔴"
     trend_emoji="📈" if sonuc["trend"]=="YUKARI" else "📉" if sonuc["trend"]=="ASAGI" else "➡️"
     macd_emoji="📊↑" if sonuc.get("macd_hist",0)>0 else "📊↓"
-
     mesaj=f"""{emoji} *{guclu}{sonuc['sinyal']} SİNYALİ* — {sonuc['hisse']}
 {sonuc['yildiz']}
 
@@ -400,52 +478,34 @@ def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None, takas=None):
 📊 *Teknik Göstergeler*
 • RSI: {sonuc['rsi']} {"🔥" if sonuc['rsi']<30 else "✅" if sonuc['rsi']<70 else "⚠️"}
 • ADX: {sonuc['adx']} {"✅" if sonuc['adx']>=18 else "⚠️"}
-• DI+/DI-: {sonuc['di_plus']} / {sonuc['di_minus']}
 • MACD: {sonuc.get('macd_durum','N/A')} {macd_emoji}
 • Bollinger: {sonuc.get('boll_pozisyon','N/A')}
 
 📐 *Pisagor Seviyeleri*
-• Üst Direnç: {sonuc['ust_direnc']}
-• Pisagor MA: {sonuc['pisagor_ma']}
-• Alt Destek: {sonuc['alt_destek']}"""
-
+• Üst: {sonuc['ust_direnc']} | MA: {sonuc['pisagor_ma']} | Alt: {sonuc['alt_destek']}"""
     if sonuc["tp"]:
-        mesaj+=f"\n\n🎯 *Hedef (TP)*: {sonuc['tp']}₺"
-    if sonuc["sl"]:
-        mesaj+=f"\n🛑 *Stop (SL)*: {sonuc['sl']}₺"
-
-    # Takas verisi
+        mesaj+=f"\n\n🎯 TP: {sonuc['tp']}₺  🛑 SL: {sonuc['sl']}₺"
     if takas:
-        durum_emoji="🟢" if takas.get("durum")=="ALICI" else "🔴" if takas.get("durum")=="SATICI" else "⚪"
-        mesaj+=f"\n\n💱 *Takas & Yabancı*"
-        if takas.get("yabanci_oran") is not None:
-            mesaj+=f"\n• Yabancı: %{takas['yabanci_oran']}"
-        if takas.get("net_yabanci") is not None:
-            mesaj+=f"\n• {durum_emoji} Net: {takas['net_yabanci']:+,.0f} lot ({takas.get('durum','')})"
-
-    # Haber duygu
+        de="🟢" if takas.get("durum")=="ALICI" else "🔴" if takas.get("durum")=="SATICI" else "⚪"
+        mesaj+=f"\n\n💱 *Takas*: Yabancı %{takas.get('yabanci_oran','?')} | {de} {takas.get('durum','')}"
     if haber_analizi:
-        duygu_emoji="✅" if haber_analizi["puan"]>3 else "⚠️" if haber_analizi["puan"]<-3 else "➡️"
-        mesaj+=f"\n\n📰 *Haber Duygusu*: {haber_analizi['duygu']} {duygu_emoji} ({haber_analizi['puan']:+d})"
+        de="✅" if haber_analizi["puan"]>3 else "⚠️" if haber_analizi["puan"]<-3 else "➡️"
+        mesaj+=f"\n📰 *Haber*: {haber_analizi['duygu']} {de} ({haber_analizi['puan']:+d})"
         if haber_analizi.get("ozet"):
             mesaj+=f"\n_{haber_analizi['ozet']}_"
-
-    # AI yorum
+    if rapor_analizi:
+        mesaj+=f"\n\n📋 *Finansal Rapor:*\n_{rapor_analizi['analiz'][:200]}_"
     if ai_yorum_metni:
-        mesaj+=f"\n\n🤖 *AI Yorumu:*\n_{ai_yorum_metni}_"
-
-    mesaj+="\n\n⚠️ _Teknik gösterge bilgisidir, yatırım tavsiyesi değildir._"
+        mesaj+=f"\n\n🤖 *AI:* _{ai_yorum_metni}_"
+    mesaj+="\n\n⚠️ _Yatırım tavsiyesi değildir._"
     return mesaj
 
 def telegram_gonder(mesaj):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     try:
-        r=requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id":TELEGRAM_CHAT_ID,"text":mesaj,"parse_mode":"Markdown"},
-            timeout=10
-        )
+        r=requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id":TELEGRAM_CHAT_ID,"text":mesaj,"parse_mode":"Markdown"},timeout=10)
         return r.status_code==200
     except:
         return False
@@ -455,7 +515,7 @@ KAP_ONEMLI=["TEMETTÜ","SERMAYE","BİRLEŞME","SATIN","FİNANSAL","GENEL KURUL",
 
 def kap_cek():
     try:
-        headers={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64)","Accept":"application/json","Referer":"https://www.kap.org.tr/"}
+        headers={"User-Agent":"Mozilla/5.0","Accept":"application/json","Referer":"https://www.kap.org.tr/"}
         r=requests.get("https://www.kap.org.tr/tr/api/disclosures",headers=headers,timeout=15)
         if r.status_code==200:
             return r.json()
@@ -475,7 +535,13 @@ def kap_mesaj(b):
     m+=f"📌 {baslik}\n"
     if tip: m+=f"📂 {tip}\n"
     if tarih: m+=f"🕐 {tarih}\n"
-    m+="\n🔗 kap.org.tr"
+    # Eğer finansal rapor ise AI ile analiz et
+    if any(k in (tip+baslik).upper() for k in ["MALİ","FİNANS","RAPOR"]) and hisse:
+        hisse_kod = hisse.split(",")[0].strip()
+        rapor = finansal_rapor_analiz(hisse_kod)
+        if rapor:
+            m+=f"\n📊 *AI Analizi:*\n_{rapor['analiz'][:200]}_"
+    m+="\n\n🔗 kap.org.tr"
     return m
 
 def arka_plan_kap():
@@ -506,32 +572,26 @@ def arka_plan_tara():
         sinyaller=[]
         for h in BIST_TUMU:
             try:
-                ticker=h+".IS"
-                sonuc=analiz_et(ticker)
+                ticker=h+".IS"; sonuc=analiz_et(ticker)
                 if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE":
-                    haber_sonuc=None; ai_yorum_metni=None; takas_sonuc=None
+                    haber_sonuc=None; ai_yorum_metni=None; takas_sonuc=None; rapor_sonuc=None
                     if sonuc["guclu"]:
-                        # Takas verisi
                         takas_sonuc=takas_cek(h)
-                        # Haber analizi
                         haberler=haber_cek(h)
-                        if haberler:
-                            haber_sonuc=duygu_analizi(h, haberler)
-                        # AI yorum
+                        if haberler: haber_sonuc=duygu_analizi(h,haberler)
+                        rapor_sonuc=finansal_rapor_analiz(h)
                         ai_yorum_metni=ai_yorum(sonuc)
                         time.sleep(1)
-                    mesaj=telegram_mesaj(sonuc, ai_yorum_metni, haber_sonuc, takas_sonuc)
+                    mesaj=telegram_mesaj(sonuc,ai_yorum_metni,haber_sonuc,takas_sonuc,rapor_sonuc)
                     sinyaller.append({
                         "hisse":h,"sinyal":sonuc["sinyal"],"guclu":sonuc["guclu"],
                         "skor":sonuc["skor"],"fiyat":sonuc["fiyat"],
                         "rsi":sonuc["rsi"],"adx":sonuc["adx"],
                         "macd_durum":sonuc.get("macd_durum",""),
                         "boll_pozisyon":sonuc.get("boll_pozisyon",""),
-                        "trend":sonuc["trend"],
-                        "takas":takas_sonuc,
-                        "haber_duygu":haber_sonuc,
-                        "ai_yorum":ai_yorum_metni,
-                        "mesaj":mesaj
+                        "trend":sonuc["trend"],"takas":takas_sonuc,
+                        "haber_duygu":haber_sonuc,"rapor_analizi":rapor_sonuc,
+                        "ai_yorum":ai_yorum_metni,"mesaj":mesaj
                     })
             except:
                 pass
@@ -542,8 +602,7 @@ def arka_plan_tara():
         with cache_lock:
             cache["sonuc"]=sinyaller
             cache["guncelleme"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cache["durum"]="tamamlandi"
-            cache["taranan"]=len(BIST_TUMU)
+            cache["durum"]="tamamlandi"; cache["taranan"]=len(BIST_TUMU)
         time.sleep(7200)
 
 # ─── ENDPOINT'LER ─────────────────────────────────────────────────────
@@ -552,30 +611,23 @@ def anasayfa():
     with cache_lock:
         d=cache["durum"]; t=cache["taranan"]; top=cache["toplam"]; g=cache["guncelleme"]
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"10.0",
+        "sistem":"Pisagor PRO API","versiyon":"11.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
-        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger","KAP Takibi","AI Yorumu","Haber Duygu","Takas & Yabancı"],
+        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger","KAP Takibi","AI Yorumu","Haber Duygu","Takas & Yabancı","Finansal Rapor AI"],
         "endpointler":{
-            "/tarama":"Sinyal sonuçları",
-            "/durum":"Tarama durumu",
-            "/kap":"KAP bildirimleri",
-            "/haber/<ticker>":"Haber duygu analizi",
-            "/takas/<ticker>":"Takas & yabancı verisi",
-            "/analiz/<ticker>":"Tam hisse analizi",
-            "/liste":"Hisse listesi"
+            "/tarama":"Sinyal sonuçları","/durum":"Tarama durumu",
+            "/kap":"KAP bildirimleri","/haber/<ticker>":"Haber duygu analizi",
+            "/takas/<ticker>":"Takas & yabancı","/rapor/<ticker>":"Finansal rapor AI analizi",
+            "/analiz/<ticker>":"Tam hisse analizi","/liste":"Hisse listesi"
         }
     })
 
 @app.route("/durum")
 def durum():
     with cache_lock:
-        return jsonify({
-            "durum":cache["durum"],"taranan":cache["taranan"],
-            "toplam":cache["toplam"],
-            "yuzde":round(cache["taranan"]/max(cache["toplam"],1)*100,1),
-            "son_guncelleme":cache["guncelleme"]
-        })
+        return jsonify({"durum":cache["durum"],"taranan":cache["taranan"],"toplam":cache["toplam"],
+            "yuzde":round(cache["taranan"]/max(cache["toplam"],1)*100,1),"son_guncelleme":cache["guncelleme"]})
 
 @app.route("/tarama")
 def tarama():
@@ -584,6 +636,13 @@ def tarama():
     if sonuc is None:
         return jsonify({"durum":d,"mesaj":f"Tarama devam ediyor... {t}/{top}","sinyal_sayisi":0,"sinyaller":[]})
     return jsonify({"durum":d,"son_guncelleme":g,"taranan":top,"sinyal_sayisi":len(sonuc),"sinyaller":sonuc})
+
+@app.route("/rapor/<ticker>")
+def rapor(ticker):
+    sonuc = finansal_rapor_analiz(ticker.upper())
+    if not sonuc:
+        return jsonify({"hata":"Finansal rapor bulunamadı veya analiz edilemedi","ticker":ticker})
+    return jsonify(sonuc)
 
 @app.route("/takas/<ticker>")
 def takas(ticker):
@@ -597,8 +656,8 @@ def haber(ticker):
     haberler=haber_cek(ticker.upper())
     if not haberler:
         return jsonify({"hata":"Haber bulunamadı","ticker":ticker})
-    analiz=duygu_analizi(ticker.upper(), haberler)
-    return jsonify({"ticker":ticker,"haber_sayisi":len(haberler),"haberler":haberler,"duygu_analizi":analiz})
+    return jsonify({"ticker":ticker,"haber_sayisi":len(haberler),"haberler":haberler,
+        "duygu_analizi":duygu_analizi(ticker.upper(),haberler)})
 
 @app.route("/kap")
 def kap():
@@ -606,21 +665,20 @@ def kap():
     if not data:
         return jsonify({"hata":"KAP'a erişilemedi"})
     bildirimler=data if isinstance(data,list) else data.get("content",[])
-    sonuc=[{"id":b.get("id",b.get("disclosureId","")),"hisse":b.get("stockCodes",[]),
-            "baslik":b.get("title",b.get("subject","")),"tip":b.get("disclosureType",b.get("type","")),
-            "tarih":b.get("publishDate",b.get("date",""))} for b in bildirimler[:20]]
+    sonuc=[{"id":b.get("id",""),"hisse":b.get("stockCodes",[]),"baslik":b.get("title",""),
+            "tip":b.get("disclosureType",""),"tarih":b.get("publishDate","")} for b in bildirimler[:20]]
     return jsonify({"toplam":len(sonuc),"bildirimler":sonuc})
 
 @app.route("/analiz/<ticker>")
 def analiz(ticker):
     if not ticker.endswith(".IS"):
         ticker=ticker+".IS"
-    h=ticker.replace(".IS","")
-    sonuc=analiz_et(ticker)
+    h=ticker.replace(".IS",""); sonuc=analiz_et(ticker)
     if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE" and ANTHROPIC_KEY:
         haberler=haber_cek(h)
         sonuc["haber_analizi"]=duygu_analizi(h,haberler) if haberler else None
         sonuc["takas"]=takas_cek(h)
+        sonuc["rapor_analizi"]=finansal_rapor_analiz(h)
         sonuc["ai_yorum"]=ai_yorum(sonuc)
     return jsonify(sonuc)
 
