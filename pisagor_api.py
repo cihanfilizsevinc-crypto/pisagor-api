@@ -19,15 +19,37 @@ cache = {
     "durum": "bekleniyor", "taranan": 0, "toplam": 0
 }
 cache_lock = threading.Lock()
+sektor_cache = {"sonuc": None, "guncelleme": None}
+sektor_lock = threading.Lock()
+korelasyon_cache = {}
+korelasyon_lock = threading.Lock()
 kap_goruldu = set()
 kap_lock = threading.Lock()
-rapor_cache = {}  # Analiz edilmiş raporları cache'le
+rapor_cache = {}
 rapor_cache_lock = threading.Lock()
 
 # ─── AYARLAR ──────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# ─── SEKTÖR GRUPLARI ──────────────────────────────────────────────────
+SEKTORLER = {
+    "Bankacılık": ["AKBNK","GARAN","HALKB","ISCTR","SKBNK","TSKB","VAKBN","YKBNK","ALBRK"],
+    "Havacılık": ["THYAO","PGSUS"],
+    "Enerji": ["AKSEN","AYDEM","ENJSA","EUPWR","ODAS","ZOREN","AYGAZ","TUPRS","PETKM"],
+    "Teknoloji": ["LOGO","TTKOM","TCELL","NETAS","ARENA","INDES"],
+    "Perakende": ["BIMAS","MGROS","SOKM","BIZIM"],
+    "Otomotiv": ["FROTO","TOASO","OTKAR","ASUZU"],
+    "Demir Çelik": ["EREGL","KRDMD","KRDMA","KRDMB","CEMTS"],
+    "GYO": ["EKGYO","TRGYO","ISGYO","VKGYO","ALGYO"],
+    "Sigorta": ["AKGRT","ANSGR","RAYSG"],
+    "Gıda": ["ULKER","CCOLA","AEFES","TATGD","BANVT"],
+    "Kimya": ["ALKIM","SASA","GUBRF","COFAZ","BAGFS"],
+    "Savunma": ["ASELS","ROKET","HATEK"],
+    "Cam & Seramik": ["SISE","TRKCM","ANACM","CIMSA","AKCNS"],
+    "Holding": ["KCHOL","SAHOL","DOHOL","GLYHO","TKFEN"],
+}
 
 # ─── BIST HİSSELERİ ───────────────────────────────────────────────────
 BIST_TUMU = [
@@ -99,19 +121,194 @@ def veri_cek(ticker):
             "volume": ohlcv["volume"],
         }, index=pd.to_datetime(timestamps, unit="s"))
         df = df.dropna()
-        if len(df) > 60:
+        if len(df) > 30:
             return df
     except:
         pass
     try:
         hisse = yf.Ticker(ticker)
         df = hisse.history(period="6mo", interval="1d")
-        if len(df) > 60:
+        if len(df) > 30:
             df.columns = [c.lower() for c in df.columns]
             return df
     except:
         pass
     return None
+
+# ─── SEKTÖR ROTASYONU ─────────────────────────────────────────────────
+def sektor_performans_hesapla():
+    """Her sektörün son 1 hafta, 1 ay performansını hesapla"""
+    sonuclar = {}
+
+    for sektor, hisseler in SEKTORLER.items():
+        haftalik = []
+        aylik = []
+
+        for h in hisseler:
+            try:
+                ticker = yf.Ticker(f"{h}.IS")
+                df = ticker.history(period="1mo", interval="1d")
+                if df is not None and len(df) > 5:
+                    close = df["Close"].dropna()
+                    if len(close) >= 5:
+                        haftalik_perf = (close.iloc[-1] / close.iloc[-5] - 1) * 100
+                        aylik_perf = (close.iloc[-1] / close.iloc[0] - 1) * 100
+                        haftalik.append(haftalik_perf)
+                        aylik.append(aylik_perf)
+            except:
+                pass
+            time.sleep(0.2)
+
+        if haftalik:
+            sonuclar[sektor] = {
+                "haftalik": round(np.mean(haftalik), 2),
+                "aylik": round(np.mean(aylik), 2),
+                "hisse_sayisi": len(hisseler),
+                "veri_sayisi": len(haftalik)
+            }
+
+    # Performansa göre sırala
+    siralanmis = sorted(sonuclar.items(), key=lambda x: x[1]["haftalik"], reverse=True)
+    
+    return {
+        "hesaplama_tarihi": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "en_iyi_sektor": siralanmis[0][0] if siralanmis else None,
+        "en_kotu_sektor": siralanmis[-1][0] if siralanmis else None,
+        "sektorler": dict(siralanmis)
+    }
+
+def arka_plan_sektor():
+    """Her 4 saatte bir sektör analizi yap"""
+    time.sleep(60)  # İlk 1 dakika bekle
+    while True:
+        try:
+            sonuc = sektor_performans_hesapla()
+            with sektor_lock:
+                sektor_cache["sonuc"] = sonuc
+                sektor_cache["guncelleme"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Sektör rotasyonu Telegram'a gönder
+            mesaj = sektor_telegram_mesaj(sonuc)
+            if mesaj:
+                telegram_gonder(mesaj)
+        except:
+            pass
+        time.sleep(14400)  # 4 saat
+
+def sektor_telegram_mesaj(sonuc):
+    if not sonuc or not sonuc.get("sektorler"):
+        return None
+    
+    sektorler = sonuc["sektorler"]
+    mesaj = f"📊 *SEKTÖR ROTASYONU*\n_{sonuc['hesaplama_tarihi']}_\n\n"
+    
+    # En iyi 3
+    mesaj += "🟢 *En Güçlü Sektörler:*\n"
+    for i, (s, v) in enumerate(list(sektorler.items())[:3]):
+        mesaj += f"{i+1}. {s}: %{v['haftalik']:+.1f} (hafta) | %{v['aylik']:+.1f} (ay)\n"
+    
+    # En kötü 3
+    mesaj += "\n🔴 *En Zayıf Sektörler:*\n"
+    items = list(sektorler.items())
+    for i, (s, v) in enumerate(items[-3:]):
+        mesaj += f"{len(items)-2+i}. {s}: %{v['haftalik']:+.1f} (hafta) | %{v['aylik']:+.1f} (ay)\n"
+    
+    return mesaj
+
+# ─── KORELASYON ANALİZİ ───────────────────────────────────────────────
+def korelasyon_hesapla(hisse1, hisse2, periyot=60):
+    """İki hisse arasındaki korelasyonu hesapla"""
+    cache_key = f"{hisse1}_{hisse2}"
+    
+    with korelasyon_lock:
+        if cache_key in korelasyon_cache:
+            return korelasyon_cache[cache_key]
+    
+    try:
+        df1 = veri_cek(f"{hisse1}.IS")
+        df2 = veri_cek(f"{hisse2}.IS")
+        
+        if df1 is None or df2 is None:
+            return None
+        
+        close1 = df1["close"].squeeze().astype(float)
+        close2 = df2["close"].squeeze().astype(float)
+        
+        # Ortak tarihleri al
+        ortak = close1.index.intersection(close2.index)
+        if len(ortak) < 20:
+            return None
+        
+        c1 = close1[ortak].tail(periyot)
+        c2 = close2[ortak].tail(periyot)
+        
+        # Günlük getiri korelasyonu
+        r1 = c1.pct_change().dropna()
+        r2 = c2.pct_change().dropna()
+        
+        korel = round(float(r1.corr(r2)), 3)
+        
+        sonuc = {
+            "hisse1": hisse1, "hisse2": hisse2,
+            "korelasyon": korel,
+            "guc": "ÇOK GÜÇLÜ" if abs(korel) > 0.8 else "GÜÇLÜ" if abs(korel) > 0.6 else "ORTA" if abs(korel) > 0.4 else "ZAYIF",
+            "yön": "POZİTİF" if korel > 0 else "NEGATİF",
+            "periyot_gun": periyot
+        }
+        
+        with korelasyon_lock:
+            korelasyon_cache[cache_key] = sonuc
+            korelasyon_cache[f"{hisse2}_{hisse1}"] = sonuc
+        
+        return sonuc
+    except:
+        return None
+
+def sektor_korelasyon(sektor_adi):
+    """Bir sektördeki tüm hisselerin korelasyon matrisi"""
+    if sektor_adi not in SEKTORLER:
+        return None
+    
+    hisseler = SEKTORLER[sektor_adi]
+    sonuclar = []
+    
+    for i in range(len(hisseler)):
+        for j in range(i+1, len(hisseler)):
+            korel = korelasyon_hesapla(hisseler[i], hisseler[j])
+            if korel:
+                sonuclar.append(korel)
+    
+    sonuclar.sort(key=lambda x: abs(x["korelasyon"]), reverse=True)
+    return {
+        "sektor": sektor_adi,
+        "hisseler": hisseler,
+        "korelasyonlar": sonuclar[:10]
+    }
+
+def en_yuksek_korelasyon(hisse_kodu, top=5):
+    """Bir hisseyle en yüksek korelasyonlu diğer hisseleri bul"""
+    # Aynı sektördeki hisselere bak
+    sektor = None
+    for s, hisseler in SEKTORLER.items():
+        if hisse_kodu in hisseler:
+            sektor = s
+            break
+    
+    karsilastir = []
+    if sektor:
+        karsilastir = [h for h in SEKTORLER[sektor] if h != hisse_kodu]
+    else:
+        # Sektör bulunamazsa BIST100'den örnekle
+        karsilastir = ["THYAO","GARAN","ASELS","KCHOL","BIMAS","EREGL","TUPRS","AKBNK","ISCTR","SISE"]
+    
+    sonuclar = []
+    for h in karsilastir[:10]:
+        korel = korelasyon_hesapla(hisse_kodu, h)
+        if korel:
+            sonuclar.append(korel)
+    
+    sonuclar.sort(key=lambda x: abs(x["korelasyon"]), reverse=True)
+    return sonuclar[:top]
 
 # ─── TEKNİK GÖSTERGELER ───────────────────────────────────────────────
 def geometrik_oran():
@@ -156,192 +353,7 @@ def hesapla_adx(high, low, close, periyot=14):
     dx = 100*(di_p-di_m).abs()/(di_p+di_m)
     return dx.rolling(window=periyot).mean(), di_p, di_m
 
-# ─── FİNANSAL RAPOR ANALİZİ ──────────────────────────────────────────
-def kap_rapor_listesi(hisse_kodu):
-    """KAP'tan şirketin son finansal raporlarını çek"""
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.kap.org.tr/"
-        }
-        # Şirkete ait bildirimler
-        url = f"https://www.kap.org.tr/tr/api/disclosures/stock/{hisse_kodu}"
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            raporlar = []
-            bildirimler = data if isinstance(data, list) else data.get("content", [])
-            for b in bildirimler:
-                tip = b.get("disclosureType", b.get("type", "")).upper()
-                if any(k in tip for k in ["MALİ", "FİNANS", "RAPOR", "FINANCIAL", "ANNUAL", "QUARTER"]):
-                    raporlar.append({
-                        "id": b.get("id", b.get("disclosureId", "")),
-                        "baslik": b.get("title", b.get("subject", "")),
-                        "tip": tip,
-                        "tarih": b.get("publishDate", b.get("date", "")),
-                        "pdf_url": b.get("pdfUrl", b.get("documentUrl", ""))
-                    })
-            return raporlar[:5]
-    except:
-        pass
-
-    # Alternatif: Genel bildirimlerden filtrele
-    try:
-        url = "https://www.kap.org.tr/tr/api/disclosures"
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json", "Referer": "https://www.kap.org.tr/"}
-        r = requests.get(url, headers=headers, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            bildirimler = data if isinstance(data, list) else data.get("content", [])
-            raporlar = []
-            for b in bildirimler:
-                kodlar = b.get("stockCodes", [])
-                if hisse_kodu in kodlar:
-                    tip = b.get("disclosureType", "").upper()
-                    if any(k in tip for k in ["MALİ", "FİNANS", "RAPOR"]):
-                        raporlar.append({
-                            "id": b.get("id", ""),
-                            "baslik": b.get("title", ""),
-                            "tip": tip,
-                            "tarih": b.get("publishDate", ""),
-                            "pdf_url": b.get("pdfUrl", "")
-                        })
-            return raporlar[:3]
-    except:
-        pass
-
-    return []
-
-def pdf_metni_cek(pdf_url):
-    """PDF'den metin çıkar"""
-    if not pdf_url:
-        return None
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(pdf_url, headers=headers, timeout=30)
-        if r.status_code == 200 and len(r.content) > 1000:
-            try:
-                import pdfplumber
-                with pdfplumber.open(io.BytesIO(r.content)) as pdf:
-                    metin = ""
-                    for sayfa in pdf.pages[:5]:  # İlk 5 sayfa yeterli
-                        metin += sayfa.extract_text() or ""
-                    return metin[:3000] if metin else None
-            except:
-                pass
-            try:
-                import PyPDF2
-                reader = PyPDF2.PdfReader(io.BytesIO(r.content))
-                metin = ""
-                for sayfa in reader.pages[:5]:
-                    metin += sayfa.extract_text() or ""
-                return metin[:3000] if metin else None
-            except:
-                pass
-    except:
-        pass
-    return None
-
-def rapor_ai_analiz(hisse_kodu, rapor_metni, rapor_baslik):
-    """AI ile finansal raporu analiz et"""
-    if not rapor_metni or not ANTHROPIC_KEY:
-        return None
-
-    with rapor_cache_lock:
-        cache_key = f"{hisse_kodu}_{rapor_baslik[:50]}"
-        if cache_key in rapor_cache:
-            return rapor_cache[cache_key]
-
-    prompt = f"""Sen bir finans analistisin. {hisse_kodu} şirketinin aşağıdaki finansal raporunu analiz et.
-
-Rapor: {rapor_baslik}
-
-İçerik:
-{rapor_metni[:2000]}
-
-Şu formatta kısa analiz yap (her madde 1 satır):
-NET KAR: [rakam ve değişim]
-CİRO: [rakam ve değişim]
-BORÇ DURUMU: [düşük/orta/yüksek ve açıklama]
-ÖNEMLI: [en önemli 1-2 bilgi]
-GENEL: [POZİTİF/NEGATİF/NÖTR - tek cümle neden]"""
-
-    try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 300,
-                  "messages": [{"role": "user", "content": prompt}]},
-            timeout=20
-        )
-        if r.status_code == 200:
-            sonuc = {
-                "analiz": r.json()["content"][0]["text"].strip(),
-                "rapor": rapor_baslik,
-                "tarih": datetime.now().strftime("%Y-%m-%d")
-            }
-            with rapor_cache_lock:
-                rapor_cache[cache_key] = sonuc
-            return sonuc
-    except:
-        pass
-    return None
-
-def finansal_rapor_analiz(hisse_kodu):
-    """Hisse için son finansal raporu bul ve analiz et"""
-    with rapor_cache_lock:
-        if hisse_kodu in rapor_cache:
-            return rapor_cache[hisse_kodu]
-
-    raporlar = kap_rapor_listesi(hisse_kodu)
-    if not raporlar:
-        return None
-
-    # İlk raporu dene
-    for rapor in raporlar:
-        if rapor.get("pdf_url"):
-            metin = pdf_metni_cek(rapor["pdf_url"])
-            if metin:
-                return rapor_ai_analiz(hisse_kodu, metin, rapor["baslik"])
-
-    return None
-
-def rapor_telegram_mesaj(analiz):
-    if not analiz or not analiz.get("analiz"):
-        return ""
-    return f"\n\n📊 *Finansal Rapor AI Analizi*\n_{analiz['rapor'][:60]}_\n{analiz['analiz']}"
-
-# ─── TAKAS & YABANCI ──────────────────────────────────────────────────
-def takas_cek(hisse_kodu):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)","Accept": "application/json"}
-    try:
-        url = f"https://www.borsaistanbul.com/api/data/equity/investor?symbol={hisse_kodu}"
-        r = requests.get(url, headers={**headers, "Referer": "https://www.borsaistanbul.com/"}, timeout=10)
-        if r.status_code == 200 and r.json():
-            data = r.json()
-            son = data[-1] if isinstance(data, list) else data
-            yabanci = float(son.get("foreignRatio", son.get("yabanci", 0)))
-            net = float(son.get("netForeign", son.get("net", 0)))
-            return {
-                "hisse": hisse_kodu, "kaynak": "BIST",
-                "yabanci_oran": round(yabanci, 2), "yerli_oran": round(100-yabanci, 2),
-                "net_yabanci": round(net, 0),
-                "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR"
-            }
-    except:
-        pass
-    try:
-        ticker = yf.Ticker(f"{hisse_kodu}.IS")
-        info = ticker.info
-        held = info.get("heldPercentInstitutions")
-        if held:
-            return {"hisse": hisse_kodu, "kaynak": "yahoo", "kurumsal_oran": round(held*100, 2)}
-    except:
-        pass
-    return None
-
-# ─── HABER DUYGU ──────────────────────────────────────────────────────
+# ─── HABER & AI ───────────────────────────────────────────────────────
 def haber_cek(hisse_kodu, max_haber=5):
     try:
         url = f"https://news.google.com/rss/search?q={hisse_kodu}+hisse+borsa&hl=tr&gl=TR&ceid=TR:tr"
@@ -350,8 +362,7 @@ def haber_cek(hisse_kodu, max_haber=5):
             root = ET.fromstring(r.content)
             haberler = []
             for item in root.findall(".//item")[:max_haber]:
-                baslik = item.find("title")
-                tarih = item.find("pubDate")
+                baslik = item.find("title"); tarih = item.find("pubDate")
                 if baslik is not None and baslik.text:
                     haberler.append({"baslik": baslik.text, "tarih": tarih.text if tarih is not None else ""})
             return haberler
@@ -365,12 +376,10 @@ def duygu_analizi(hisse_kodu, haberler):
     haber_metni = "\n".join([f"- {h['baslik']}" for h in haberler[:5]])
     prompt = f"""{hisse_kodu} haberleri:\n{haber_metni}\n\nSadece:\nDUYGU: [POZİTİF/NEGATİF/NÖTR]\nPUAN: [-10/+10]\nÖZET: [tek cümle]"""
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
+        r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={"model": "claude-haiku-4-5-20251001", "max_tokens": 100, "messages": [{"role": "user", "content": prompt}]},
-            timeout=15
-        )
+            timeout=15)
         if r.status_code == 200:
             yanit = r.json()["content"][0]["text"].strip()
             duygu="NÖTR"; puan=0; ozet=""
@@ -380,7 +389,7 @@ def duygu_analizi(hisse_kodu, haberler):
                     try: puan=int(satir.split("PUAN:")[-1].strip())
                     except: puan=0
                 elif "ÖZET:" in satir: ozet=satir.split("ÖZET:")[-1].strip()
-            return {"duygu":duygu,"puan":puan,"ozet":ozet,"haber_sayisi":len(haberler)}
+            return {"duygu":duygu,"puan":puan,"ozet":ozet}
     except:
         pass
     return None
@@ -390,17 +399,37 @@ def ai_yorum(sonuc):
         return None
     try:
         prompt = f"""Borsa analisti: {sonuc['hisse']} için 2 cümle teknik yorum. Türkçe. Tavsiye verme.
-RSI:{sonuc['rsi']} ADX:{sonuc['adx']} MACD:{sonuc.get('macd_durum','')} Bollinger:{sonuc.get('boll_pozisyon','')} Trend:{sonuc['trend']}"""
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
+RSI:{sonuc['rsi']} ADX:{sonuc['adx']} MACD:{sonuc.get('macd_durum','')} Trend:{sonuc['trend']}"""
+        r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150, "messages": [{"role": "user", "content": prompt}]},
-            timeout=15
-        )
+            timeout=15)
         if r.status_code == 200:
             return r.json()["content"][0]["text"].strip()
     except:
         pass
+    return None
+
+def takas_cek(hisse_kodu):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", "Accept": "application/json"}
+    try:
+        url = f"https://www.borsaistanbul.com/api/data/equity/investor?symbol={hisse_kodu}"
+        r = requests.get(url, headers={**headers, "Referer": "https://www.borsaistanbul.com/"}, timeout=10)
+        if r.status_code == 200 and r.json():
+            data = r.json()
+            son = data[-1] if isinstance(data, list) else data
+            yabanci = float(son.get("foreignRatio", son.get("yabanci", 0)))
+            net = float(son.get("netForeign", son.get("net", 0)))
+            return {"hisse": hisse_kodu, "yabanci_oran": round(yabanci, 2),
+                    "net_yabanci": round(net, 0), "durum": "ALICI" if net>0 else "SATICI" if net<0 else "NÖTR"}
+    except:
+        pass
+    return None
+
+def finansal_rapor_analiz(hisse_kodu):
+    with rapor_cache_lock:
+        if hisse_kodu in rapor_cache:
+            return rapor_cache[hisse_kodu]
     return None
 
 # ─── ANALİZ ───────────────────────────────────────────────────────────
@@ -452,10 +481,14 @@ def analiz_et(ticker, lookback=50):
     elif bool(sat_sinyal.iloc[s]):
         sinyal_tip="SAT"; sinyal_skor=skor(t_down,rsi_sat,adx_ok,vol_ok,di_bear)
         tp_sev=son_b_md; sl_sev=round(son_b_mu*1.01,2)
+    
+    # Sektör bilgisi ekle
+    sektor = next((s for s, h in SEKTORLER.items() if ticker.replace(".IS","") in h), "Diğer")
+    
     return {
         "hisse":ticker,"fiyat":son_fiyat,"sinyal":sinyal_tip,"guclu":sinyal_guclu,
         "skor":sinyal_skor,"yildiz":"★"*sinyal_skor+"☆"*(5-sinyal_skor),
-        "tp":tp_sev,"sl":sl_sev,"trend":trend_txt,
+        "tp":tp_sev,"sl":sl_sev,"trend":trend_txt,"sektor":sektor,
         "rsi":son_rsi,"adx":son_adx,"di_plus":son_dip,"di_minus":son_dim,
         "macd_hist":son_macd_hist,"macd_durum":macd_durum,
         "boll_ust":son_boll_ust,"boll_alt":son_boll_alt,"boll_pozisyon":boll_pos,
@@ -464,39 +497,49 @@ def analiz_et(ticker, lookback=50):
     }
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────
-def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None, takas=None, rapor_analizi=None):
+def telegram_mesaj(sonuc, ai_yorum_metni=None, haber_analizi=None, takas=None, korelasyonlar=None):
     guclu="💪 GÜÇLÜ " if sonuc["guclu"] else ""
     emoji="🟢" if sonuc["sinyal"]=="AL" else "🔴"
     trend_emoji="📈" if sonuc["trend"]=="YUKARI" else "📉" if sonuc["trend"]=="ASAGI" else "➡️"
     macd_emoji="📊↑" if sonuc.get("macd_hist",0)>0 else "📊↓"
+    sektor = sonuc.get("sektor","")
+    
     mesaj=f"""{emoji} *{guclu}{sonuc['sinyal']} SİNYALİ* — {sonuc['hisse']}
-{sonuc['yildiz']}
+{sonuc['yildiz']} | 🏭 {sektor}
 
 💰 Fiyat: *{sonuc['fiyat']}₺*
 {trend_emoji} Trend: {sonuc['trend']}
 
-📊 *Teknik Göstergeler*
-• RSI: {sonuc['rsi']} {"🔥" if sonuc['rsi']<30 else "✅" if sonuc['rsi']<70 else "⚠️"}
-• ADX: {sonuc['adx']} {"✅" if sonuc['adx']>=18 else "⚠️"}
+📊 *Teknik*
+• RSI: {sonuc['rsi']} {"🔥" if sonuc['rsi']<30 else "✅" if sonuc['rsi']<70 else "⚠️"} | ADX: {sonuc['adx']} {"✅" if sonuc['adx']>=18 else "⚠️"}
 • MACD: {sonuc.get('macd_durum','N/A')} {macd_emoji}
 • Bollinger: {sonuc.get('boll_pozisyon','N/A')}
 
-📐 *Pisagor Seviyeleri*
-• Üst: {sonuc['ust_direnc']} | MA: {sonuc['pisagor_ma']} | Alt: {sonuc['alt_destek']}"""
+📐 Üst: {sonuc['ust_direnc']} | MA: {sonuc['pisagor_ma']} | Alt: {sonuc['alt_destek']}"""
+
     if sonuc["tp"]:
-        mesaj+=f"\n\n🎯 TP: {sonuc['tp']}₺  🛑 SL: {sonuc['sl']}₺"
+        mesaj+=f"\n🎯 TP: {sonuc['tp']}₺  🛑 SL: {sonuc['sl']}₺"
+    
     if takas:
         de="🟢" if takas.get("durum")=="ALICI" else "🔴" if takas.get("durum")=="SATICI" else "⚪"
-        mesaj+=f"\n\n💱 *Takas*: Yabancı %{takas.get('yabanci_oran','?')} | {de} {takas.get('durum','')}"
+        mesaj+=f"\n\n💱 Takas: Yabancı %{takas.get('yabanci_oran','?')} {de}"
+    
     if haber_analizi:
         de="✅" if haber_analizi["puan"]>3 else "⚠️" if haber_analizi["puan"]<-3 else "➡️"
-        mesaj+=f"\n📰 *Haber*: {haber_analizi['duygu']} {de} ({haber_analizi['puan']:+d})"
+        mesaj+=f"\n📰 Haber: {haber_analizi['duygu']} {de} ({haber_analizi['puan']:+d})"
         if haber_analizi.get("ozet"):
             mesaj+=f"\n_{haber_analizi['ozet']}_"
-    if rapor_analizi:
-        mesaj+=f"\n\n📋 *Finansal Rapor:*\n_{rapor_analizi['analiz'][:200]}_"
+    
+    # Korelasyon uyarısı
+    if korelasyonlar:
+        guclu_korel = [k for k in korelasyonlar if abs(k["korelasyon"]) > 0.7]
+        if guclu_korel:
+            diger = guclu_korel[0]["hisse2"] if guclu_korel[0]["hisse1"] == sonuc["hisse"].replace(".IS","") else guclu_korel[0]["hisse1"]
+            mesaj+=f"\n\n🔗 *Korelasyon*: {diger} ile %{abs(guclu_korel[0]['korelasyon'])*100:.0f} uyumlu hareket ediyor"
+    
     if ai_yorum_metni:
         mesaj+=f"\n\n🤖 *AI:* _{ai_yorum_metni}_"
+    
     mesaj+="\n\n⚠️ _Yatırım tavsiyesi değildir._"
     return mesaj
 
@@ -535,13 +578,7 @@ def kap_mesaj(b):
     m+=f"📌 {baslik}\n"
     if tip: m+=f"📂 {tip}\n"
     if tarih: m+=f"🕐 {tarih}\n"
-    # Eğer finansal rapor ise AI ile analiz et
-    if any(k in (tip+baslik).upper() for k in ["MALİ","FİNANS","RAPOR"]) and hisse:
-        hisse_kod = hisse.split(",")[0].strip()
-        rapor = finansal_rapor_analiz(hisse_kod)
-        if rapor:
-            m+=f"\n📊 *AI Analizi:*\n_{rapor['analiz'][:200]}_"
-    m+="\n\n🔗 kap.org.tr"
+    m+="\n🔗 kap.org.tr"
     return m
 
 def arka_plan_kap():
@@ -574,23 +611,23 @@ def arka_plan_tara():
             try:
                 ticker=h+".IS"; sonuc=analiz_et(ticker)
                 if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE":
-                    haber_sonuc=None; ai_yorum_metni=None; takas_sonuc=None; rapor_sonuc=None
+                    haber_sonuc=None; ai_yorum_metni=None; takas_sonuc=None; korel_sonuc=None
                     if sonuc["guclu"]:
                         takas_sonuc=takas_cek(h)
                         haberler=haber_cek(h)
                         if haberler: haber_sonuc=duygu_analizi(h,haberler)
-                        rapor_sonuc=finansal_rapor_analiz(h)
+                        korel_sonuc=en_yuksek_korelasyon(h, top=3)
                         ai_yorum_metni=ai_yorum(sonuc)
                         time.sleep(1)
-                    mesaj=telegram_mesaj(sonuc,ai_yorum_metni,haber_sonuc,takas_sonuc,rapor_sonuc)
+                    mesaj=telegram_mesaj(sonuc,ai_yorum_metni,haber_sonuc,takas_sonuc,korel_sonuc)
                     sinyaller.append({
                         "hisse":h,"sinyal":sonuc["sinyal"],"guclu":sonuc["guclu"],
-                        "skor":sonuc["skor"],"fiyat":sonuc["fiyat"],
+                        "skor":sonuc["skor"],"fiyat":sonuc["fiyat"],"sektor":sonuc.get("sektor",""),
                         "rsi":sonuc["rsi"],"adx":sonuc["adx"],
                         "macd_durum":sonuc.get("macd_durum",""),
                         "boll_pozisyon":sonuc.get("boll_pozisyon",""),
                         "trend":sonuc["trend"],"takas":takas_sonuc,
-                        "haber_duygu":haber_sonuc,"rapor_analizi":rapor_sonuc,
+                        "haber_duygu":haber_sonuc,"korelasyonlar":korel_sonuc,
                         "ai_yorum":ai_yorum_metni,"mesaj":mesaj
                     })
             except:
@@ -610,24 +647,32 @@ def arka_plan_tara():
 def anasayfa():
     with cache_lock:
         d=cache["durum"]; t=cache["taranan"]; top=cache["toplam"]; g=cache["guncelleme"]
+    with sektor_lock:
+        sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"11.0",
+        "sistem":"Pisagor PRO API","versiyon":"12.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
-        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger","KAP Takibi","AI Yorumu","Haber Duygu","Takas & Yabancı","Finansal Rapor AI"],
+        "sektor_guncelleme":sg,
+        "ozellikler":["Pisagor MA","RSI","ADX","MACD","Bollinger","KAP Takibi","AI Yorumu",
+                      "Haber Duygu","Takas & Yabancı","Finansal Rapor AI","Sektör Rotasyonu","Korelasyon Analizi"],
         "endpointler":{
             "/tarama":"Sinyal sonuçları","/durum":"Tarama durumu",
+            "/sektor":"Sektör rotasyonu","/sektor/<ad>":"Sektör korelasyon analizi",
+            "/korelasyon/<h1>/<h2>":"İki hisse korelasyonu",
+            "/korelasyon/<ticker>":"Hissenin en yüksek korelasyonları",
             "/kap":"KAP bildirimleri","/haber/<ticker>":"Haber duygu analizi",
-            "/takas/<ticker>":"Takas & yabancı","/rapor/<ticker>":"Finansal rapor AI analizi",
-            "/analiz/<ticker>":"Tam hisse analizi","/liste":"Hisse listesi"
+            "/takas/<ticker>":"Takas & yabancı","/analiz/<ticker>":"Tam hisse analizi",
+            "/liste":"Hisse listesi"
         }
     })
 
 @app.route("/durum")
 def durum():
     with cache_lock:
-        return jsonify({"durum":cache["durum"],"taranan":cache["taranan"],"toplam":cache["toplam"],
-            "yuzde":round(cache["taranan"]/max(cache["toplam"],1)*100,1),"son_guncelleme":cache["guncelleme"]})
+        return jsonify({"durum":cache["durum"],"taranan":cache["taranan"],
+            "toplam":cache["toplam"],"yuzde":round(cache["taranan"]/max(cache["toplam"],1)*100,1),
+            "son_guncelleme":cache["guncelleme"]})
 
 @app.route("/tarama")
 def tarama():
@@ -637,27 +682,47 @@ def tarama():
         return jsonify({"durum":d,"mesaj":f"Tarama devam ediyor... {t}/{top}","sinyal_sayisi":0,"sinyaller":[]})
     return jsonify({"durum":d,"son_guncelleme":g,"taranan":top,"sinyal_sayisi":len(sonuc),"sinyaller":sonuc})
 
-@app.route("/rapor/<ticker>")
-def rapor(ticker):
-    sonuc = finansal_rapor_analiz(ticker.upper())
+@app.route("/sektor")
+def sektor():
+    with sektor_lock:
+        sonuc=sektor_cache["sonuc"]
     if not sonuc:
-        return jsonify({"hata":"Finansal rapor bulunamadı veya analiz edilemedi","ticker":ticker})
+        return jsonify({"mesaj":"Sektör analizi henüz tamamlanmadı, ~1 saat sonra tekrar dene"})
     return jsonify(sonuc)
 
-@app.route("/takas/<ticker>")
-def takas(ticker):
-    sonuc=takas_cek(ticker.upper())
+@app.route("/sektor/<sektor_adi>")
+def sektor_detay(sektor_adi):
+    # URL encoding düzelt
+    sektor_adi = sektor_adi.replace("-"," ")
+    if sektor_adi not in SEKTORLER:
+        return jsonify({"hata":f"Sektör bulunamadı","mevcut":list(SEKTORLER.keys())})
+    return jsonify(sektor_korelasyon(sektor_adi))
+
+@app.route("/korelasyon/<h1>/<h2>")
+def korelasyon_iki(h1, h2):
+    sonuc=korelasyon_hesapla(h1.upper(), h2.upper())
     if not sonuc:
-        return jsonify({"hata":"Takas verisi bulunamadı","ticker":ticker})
+        return jsonify({"hata":"Korelasyon hesaplanamadı"})
     return jsonify(sonuc)
+
+@app.route("/korelasyon/<ticker>")
+def korelasyon_hisse(ticker):
+    sonuclar=en_yuksek_korelasyon(ticker.upper())
+    return jsonify({"hisse":ticker,"korelasyonlar":sonuclar})
 
 @app.route("/haber/<ticker>")
 def haber(ticker):
     haberler=haber_cek(ticker.upper())
     if not haberler:
-        return jsonify({"hata":"Haber bulunamadı","ticker":ticker})
-    return jsonify({"ticker":ticker,"haber_sayisi":len(haberler),"haberler":haberler,
-        "duygu_analizi":duygu_analizi(ticker.upper(),haberler)})
+        return jsonify({"hata":"Haber bulunamadı"})
+    return jsonify({"ticker":ticker,"haberler":haberler,"duygu_analizi":duygu_analizi(ticker.upper(),haberler)})
+
+@app.route("/takas/<ticker>")
+def takas(ticker):
+    sonuc=takas_cek(ticker.upper())
+    if not sonuc:
+        return jsonify({"hata":"Takas verisi bulunamadı"})
+    return jsonify(sonuc)
 
 @app.route("/kap")
 def kap():
@@ -674,23 +739,25 @@ def analiz(ticker):
     if not ticker.endswith(".IS"):
         ticker=ticker+".IS"
     h=ticker.replace(".IS",""); sonuc=analiz_et(ticker)
-    if "hata" not in sonuc and sonuc["sinyal"]!="BEKLE" and ANTHROPIC_KEY:
-        haberler=haber_cek(h)
-        sonuc["haber_analizi"]=duygu_analizi(h,haberler) if haberler else None
-        sonuc["takas"]=takas_cek(h)
-        sonuc["rapor_analizi"]=finansal_rapor_analiz(h)
-        sonuc["ai_yorum"]=ai_yorum(sonuc)
+    if "hata" not in sonuc:
+        sonuc["korelasyonlar"]=en_yuksek_korelasyon(h, top=3)
+        if sonuc["sinyal"]!="BEKLE" and ANTHROPIC_KEY:
+            haberler=haber_cek(h)
+            sonuc["haber_analizi"]=duygu_analizi(h,haberler) if haberler else None
+            sonuc["takas"]=takas_cek(h)
+            sonuc["ai_yorum"]=ai_yorum(sonuc)
     return jsonify(sonuc)
 
 @app.route("/liste")
 def liste():
-    return jsonify({"toplam":len(BIST_TUMU),"hisseler":BIST_TUMU})
+    return jsonify({"toplam":len(BIST_TUMU),"hisseler":BIST_TUMU,"sektorler":SEKTORLER})
 
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
     t2=threading.Thread(target=arka_plan_kap, daemon=True)
-    t1.start(); t2.start()
+    t3=threading.Thread(target=arka_plan_sektor, daemon=True)
+    t1.start(); t2.start(); t3.start()
 
 if __name__=="__main__":
     baslat()
