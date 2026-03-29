@@ -30,6 +30,8 @@ akilli_para_cache = {"sonuc": [], "guncelleme": None}
 akilli_para_lock = threading.Lock()
 korku_cache = {"endeks": None, "seviye": None, "guncelleme": None}
 korku_lock = threading.Lock()
+sosyal_cache = {}
+sosyal_lock = threading.Lock()
 sektor_cache = {"sonuc": None, "guncelleme": None}
 sektor_lock = threading.Lock()
 korelasyon_cache = {}
@@ -661,7 +663,7 @@ def anasayfa():
     with sektor_lock:
         sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"16.0",
+        "sistem":"Pisagor PRO API","versiyon":"17.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
         "sektor_guncelleme":sg,
@@ -1434,6 +1436,281 @@ def korku():
 
     return jsonify(detay)
 
+# ─── SOSYAL MEDYA SENTİMENT ───────────────────────────────────────────
+def eksi_sozluk_tara(hisse_kodu):
+    """Ekşi Sözlük'ten hisse başlığını tara"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "tr-TR,tr;q=0.9"
+        }
+        # Ekşi Sözlük arama
+        arama = f"{hisse_kodu.lower()} hisse"
+        r = requests.get(
+            f"https://eksisozluk.com/basliklar/ara?q={arama}",
+            headers=headers, timeout=10
+        )
+        if r.status_code == 200:
+            import re
+            # Başlık ve entry sayılarını çıkar
+            basliklar = re.findall(r'<a href="/([^"]+)">([^<]+)</a>\s*<span[^>]*>(\d+)</span>', r.text)
+            sonuclar = []
+            for url, baslik, entry_sayisi in basliklar[:5]:
+                if hisse_kodu.lower() in baslik.lower() or "hisse" in baslik.lower():
+                    sonuclar.append({
+                        "baslik": baslik.strip(),
+                        "entry_sayisi": int(entry_sayisi),
+                        "url": f"https://eksisozluk.com/{url}"
+                    })
+            return sonuclar
+    except:
+        pass
+    return []
+
+def eksi_entry_cek(baslik_url, max_entry=10):
+    """Ekşi Sözlük başlığından entry'leri çek"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "text/html"
+        }
+        r = requests.get(baslik_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            import re
+            # Entry içeriklerini çıkar
+            entryler = re.findall(r'<div class="content">(.+?)</div>', r.text, re.DOTALL)
+            temiz = []
+            for e in entryler[:max_entry]:
+                # HTML taglerini temizle
+                temiz_metin = re.sub(r'<[^>]+>', '', e).strip()
+                if temiz_metin and len(temiz_metin) > 10:
+                    temiz.append(temiz_metin[:200])
+            return temiz
+    except:
+        pass
+    return []
+
+def google_haberler_genislet(hisse_kodu, max_haber=10):
+    """Daha kapsamlı Google News taraması"""
+    tum_haberler = []
+    aramalar = [
+        f"{hisse_kodu} hisse senedi",
+        f"{hisse_kodu} borsa BIST",
+        f"{hisse_kodu}.IS yatırım"
+    ]
+    for arama in aramalar:
+        try:
+            url = f"https://news.google.com/rss/search?q={arama}&hl=tr&gl=TR&ceid=TR:tr"
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            if r.status_code == 200:
+                root = ET.fromstring(r.content)
+                for item in root.findall(".//item")[:5]:
+                    baslik = item.find("title")
+                    tarih = item.find("pubDate")
+                    if baslik is not None and baslik.text:
+                        tum_haberler.append({
+                            "baslik": baslik.text,
+                            "tarih": tarih.text if tarih is not None else "",
+                            "kaynak": "google_news"
+                        })
+            time.sleep(0.3)
+        except:
+            pass
+    # Tekrarları kaldır
+    goruldu = set()
+    benzersiz = []
+    for h in tum_haberler:
+        if h["baslik"] not in goruldu:
+            goruldu.add(h["baslik"])
+            benzersiz.append(h)
+    return benzersiz[:max_haber]
+
+def sosyal_sentiment_analiz(hisse_kodu):
+    """Tüm kaynaklardan sosyal medya sentiment analizi"""
+    with sosyal_lock:
+        if hisse_kodu in sosyal_cache:
+            cached = sosyal_cache[hisse_kodu]
+            # 30 dakikadan yeni ise cache'den dön
+            if (datetime.now() - cached["hesap_zamani"]).seconds < 1800:
+                return cached
+
+    if not ANTHROPIC_KEY:
+        return None
+
+    # Veri topla
+    haberler = google_haberler_genislet(hisse_kodu, max_haber=10)
+    eksi_basliklar = eksi_sozluk_tara(hisse_kodu)
+
+    # Ekşi entry'leri çek (ilk başlık)
+    eksi_entryler = []
+    if eksi_basliklar:
+        eksi_entryler = eksi_entry_cek(eksi_basliklar[0]["url"], max_entry=5)
+
+    if not haberler and not eksi_entryler:
+        return None
+
+    # AI ile analiz et
+    icerik = ""
+    if haberler:
+        icerik += "📰 Haberler:\n"
+        icerik += "\n".join([f"- {h['baslik']}" for h in haberler[:8]])
+
+    if eksi_entryler:
+        icerik += "\n\n💬 Ekşi Sözlük:\n"
+        icerik += "\n".join([f"- {e[:100]}" for e in eksi_entryler[:5]])
+
+    prompt = f"""{hisse_kodu} hissesi hakkında sosyal medya ve haber analizini yap.
+
+İçerik:
+{icerik}
+
+Şu formatta cevap ver:
+GENEL_DUYGU: [POZİTİF/NEGATİF/NÖTR/KARIŞIK]
+HABER_SKORU: [-10 ile +10]
+SOSYAL_SKORU: [-10 ile +10]
+TREND: [YÜKSELİYOR/DÜŞÜYOR/YATAY] (bahsedilme sıklığı)
+OZET: [2 cümle Türkçe özet]
+RISKLER: [varsa önemli risk 1 cümle]"""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 250,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=20
+        )
+        if r.status_code == 200:
+            yanit = r.json()["content"][0]["text"].strip()
+
+            # Parse et
+            sonuc = {
+                "hisse": hisse_kodu,
+                "genel_duygu": "NÖTR",
+                "haber_skoru": 0,
+                "sosyal_skoru": 0,
+                "trend": "YATAY",
+                "ozet": "",
+                "riskler": "",
+                "haber_sayisi": len(haberler),
+                "eksi_baslik_sayisi": len(eksi_basliklar),
+                "hesap_zamani": datetime.now()
+            }
+
+            for satir in yanit.split("\n"):
+                if "GENEL_DUYGU:" in satir:
+                    sonuc["genel_duygu"] = satir.split(":")[-1].strip()
+                elif "HABER_SKORU:" in satir:
+                    try: sonuc["haber_skoru"] = int(satir.split(":")[-1].strip())
+                    except: pass
+                elif "SOSYAL_SKORU:" in satir:
+                    try: sonuc["sosyal_skoru"] = int(satir.split(":")[-1].strip())
+                    except: pass
+                elif "TREND:" in satir:
+                    sonuc["trend"] = satir.split(":")[-1].strip()
+                elif "OZET:" in satir:
+                    sonuc["ozet"] = satir.split("OZET:")[-1].strip()
+                elif "RISKLER:" in satir:
+                    sonuc["riskler"] = satir.split("RISKLER:")[-1].strip()
+
+            # Toplam skor
+            sonuc["toplam_skor"] = round((sonuc["haber_skoru"] + sonuc["sosyal_skoru"]) / 2, 1)
+
+            with sosyal_lock:
+                sosyal_cache[hisse_kodu] = sonuc
+
+            return sonuc
+    except:
+        pass
+    return None
+
+def sosyal_telegram_mesaj(hisse_kodu, analiz):
+    """Sosyal medya sentiment Telegram mesajı"""
+    if not analiz:
+        return None
+
+    duygu = analiz["genel_duygu"]
+    skor = analiz["toplam_skor"]
+
+    if "POZİTİF" in duygu or skor > 3:
+        emoji = "📱✅"
+    elif "NEGATİF" in duygu or skor < -3:
+        emoji = "📱⚠️"
+    else:
+        emoji = "📱➡️"
+
+    trend_emoji = "📈" if "YÜKSELİYOR" in analiz["trend"] else "📉" if "DÜŞÜYOR" in analiz["trend"] else "➡️"
+
+    mesaj = f"""{emoji} *SOSYAL MEDYA SENTİMENTİ — {hisse_kodu}*
+
+🎯 Genel Duygu: *{duygu}*
+📊 Toplam Skor: {skor:+.1f}/10
+{trend_emoji} Bahsedilme Trendi: {analiz['trend']}
+
+📰 Haber Skoru: {analiz['haber_skoru']:+d}
+💬 Sosyal Skor: {analiz['sosyal_skoru']:+d}
+
+📝 _{analiz['ozet']}_"""
+
+    if analiz.get("riskler"):
+        mesaj += f"\n\n⚠️ Risk: _{analiz['riskler']}_"
+
+    mesaj += f"\n\n🔍 {analiz['haber_sayisi']} haber | {analiz['eksi_baslik_sayisi']} Ekşi başlığı analiz edildi"
+    return mesaj
+
+def arka_plan_sosyal():
+    """Sinyal veren güçlü hisseler için sosyal medya analizi yap"""
+    time.sleep(150)
+    while True:
+        try:
+            with cache_lock:
+                sinyaller = cache["sonuc"] or []
+
+            # Sadece güçlü sinyallerin sosyal analizini yap
+            guclu = [s for s in sinyaller if s.get("guclu")][:10]
+
+            for s in guclu:
+                hisse = s["hisse"]
+                analiz = sosyal_sentiment_analiz(hisse)
+                if analiz:
+                    # Çok negatif sosyal sentiment varsa uyar
+                    if analiz["toplam_skor"] < -5:
+                        mesaj = sosyal_telegram_mesaj(hisse, analiz)
+                        if mesaj:
+                            telegram_gonder(f"⚠️ *SOSYAL MEDYA UYARISI*\n\n" + mesaj)
+                time.sleep(3)
+
+        except:
+            pass
+        time.sleep(3600)  # 1 saat
+
+@app.route("/sosyal/<ticker>")
+def sosyal(ticker):
+    """Hisse sosyal medya sentiment analizi"""
+    hisse = ticker.upper()
+    analiz = sosyal_sentiment_analiz(hisse)
+    if not analiz:
+        return jsonify({"hata": "Sosyal medya analizi yapılamadı", "ticker": hisse})
+    # datetime serialize edilemez, çıkar
+    sonuc = {k: v for k, v in analiz.items() if k != "hesap_zamani"}
+    return jsonify(sonuc)
+
+@app.route("/sosyal-ozet")
+def sosyal_ozet():
+    """Tüm analiz edilen hisselerin sosyal sentiment özeti"""
+    with sosyal_lock:
+        sonuclar = []
+        for hisse, analiz in sosyal_cache.items():
+            sonuclar.append({
+                "hisse": hisse,
+                "genel_duygu": analiz["genel_duygu"],
+                "toplam_skor": analiz["toplam_skor"],
+                "trend": analiz["trend"]
+            })
+    sonuclar.sort(key=lambda x: x["toplam_skor"], reverse=True)
+    return jsonify({"analiz_sayisi": len(sonuclar), "sonuclar": sonuclar})
+
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
@@ -1443,7 +1720,8 @@ def baslat():
     t5=threading.Thread(target=arka_plan_insider, daemon=True)
     t6=threading.Thread(target=arka_plan_akilli_para, daemon=True)
     t7=threading.Thread(target=arka_plan_korku, daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start(); t5.start(); t6.start(); t7.start()
+    t8=threading.Thread(target=arka_plan_sosyal, daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start(); t5.start(); t6.start(); t7.start(); t8.start()
 
 if __name__=="__main__":
     baslat()
