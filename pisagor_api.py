@@ -24,6 +24,8 @@ cache_lock = threading.Lock()
 # ─── DİNAMİK HİSSE LİSTESİ CACHE ─────────────────────────────────────
 liste_cache = {"hisseler": None, "guncelleme": None}
 liste_lock = threading.Lock()
+insider_goruldu = set()
+insider_lock = threading.Lock()
 sektor_cache = {"sonuc": None, "guncelleme": None}
 sektor_lock = threading.Lock()
 korelasyon_cache = {}
@@ -655,7 +657,7 @@ def anasayfa():
     with sektor_lock:
         sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"13.0",
+        "sistem":"Pisagor PRO API","versiyon":"14.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
         "sektor_guncelleme":sg,
@@ -668,7 +670,7 @@ def anasayfa():
             "/korelasyon/<ticker>":"Hissenin en yüksek korelasyonları",
             "/kap":"KAP bildirimleri","/haber/<ticker>":"Haber duygu analizi",
             "/takas/<ticker>":"Takas & yabancı","/analiz/<ticker>":"Tam hisse analizi",
-            "/liste":"Hisse listesi"
+            "/liste":"Hisse listesi","/insider":"İnsider işlemleri"
         }
     })
 
@@ -865,13 +867,171 @@ def arka_plan_liste_guncelle():
         # Her 24 saatte bir güncelle
         time.sleep(86400)
 
+# ─── INSIDER TRADING DEDEKTÖRü ───────────────────────────────────────
+INSIDER_TIPLER = [
+    "İÇERİDEN", "INSIDER", "YÖNETİCİ", "ORTAKLIK",
+    "PAY EDİNİM", "PAY SATIM", "HİSSE ALIM", "HİSSE SATIM",
+    "SERMAYE PİYASASI KURULU", "SPK BİLDİRİM"
+]
+
+def insider_bildirimleri_cek():
+    """KAP'tan içeriden öğrenen işlem bildirimlerini çek"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.kap.org.tr/"
+    }
+
+    # Yöntem 1: KAP insider endpoint
+    try:
+        r = requests.get(
+            "https://www.kap.org.tr/tr/api/disclosures/insider",
+            headers=headers, timeout=15
+        )
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+
+    # Yöntem 2: Genel bildirimleri filtrele
+    try:
+        r = requests.get(
+            "https://www.kap.org.tr/tr/api/disclosures",
+            headers=headers, timeout=15
+        )
+        if r.status_code == 200:
+            data = r.json()
+            bildirimler = data if isinstance(data, list) else data.get("content", [])
+            insider = []
+            for b in bildirimler:
+                tip = b.get("disclosureType", b.get("type", "")).upper()
+                baslik = b.get("title", b.get("subject", "")).upper()
+                if any(k in tip or k in baslik for k in INSIDER_TIPLER):
+                    insider.append(b)
+            return insider
+    except:
+        pass
+
+    return []
+
+def insider_mesaj_olustur(bildirim):
+    """İnsider işlem Telegram mesajı oluştur"""
+    hisse = ", ".join(bildirim.get("stockCodes", [])[:3]) if bildirim.get("stockCodes") else ""
+    baslik = bildirim.get("title", bildirim.get("subject", ""))[:200]
+    tip = bildirim.get("disclosureType", bildirim.get("type", ""))
+    tarih = bildirim.get("publishDate", bildirim.get("date", ""))
+
+    # İşlem türünü belirle
+    baslik_upper = baslik.upper()
+    if any(k in baslik_upper for k in ["ALIM", "EDİNİM", "SATIN ALDI", "ARTIRDI"]):
+        islem_emoji = "🟢"
+        islem_tip = "HİSSE ALIMI"
+    elif any(k in baslik_upper for k in ["SATIM", "SATTI", "AZALTTI", "ELDEN ÇIKARDI"]):
+        islem_emoji = "🔴"
+        islem_tip = "HİSSE SATIMI"
+    else:
+        islem_emoji = "🔔"
+        islem_tip = "YÖNETİCİ İŞLEMİ"
+
+    mesaj = f"""{islem_emoji} *{islem_tip} — İÇERİDEN ÖĞRENEN*
+
+🏢 *{hisse}*
+📌 {baslik}
+📂 {tip}
+🕐 {tarih}
+
+💡 _Yöneticiler ve büyük ortakların işlemleri genellikle piyasadan önce bilgi sahibi olmaktan kaynaklanır._
+
+🔗 kap.org.tr"""
+
+    return mesaj
+
+def insider_ai_analiz(bildirim):
+    """AI ile insider işlemi analiz et"""
+    if not ANTHROPIC_KEY:
+        return None
+
+    hisse = ", ".join(bildirim.get("stockCodes", [])[:3]) if bildirim.get("stockCodes") else ""
+    baslik = bildirim.get("title", bildirim.get("subject", ""))[:300]
+
+    prompt = f"""Şu KAP bildirimi bir içeriden öğrenen (insider) işlemidir:
+
+Hisse: {hisse}
+Açıklama: {baslik}
+
+Bu işlemin yatırımcılar için ne anlam ifade ettiğini 2 cümleyle açıkla. Türkçe. Yorum yap ama kesin tavsiye verme."""
+
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 150,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=15
+        )
+        if r.status_code == 200:
+            return r.json()["content"][0]["text"].strip()
+    except:
+        pass
+    return None
+
+def arka_plan_insider():
+    """Her 15 dakikada insider işlemleri kontrol et"""
+    global insider_goruldu
+    time.sleep(45)  # 45 saniye bekle
+    while True:
+        try:
+            bildirimler = insider_bildirimleri_cek()
+            for b in bildirimler[:20]:
+                bid = str(b.get("id", b.get("disclosureId", b.get("no", ""))))
+                if bid and bid not in insider_goruldu:
+                    with insider_lock:
+                        insider_goruldu.add(bid)
+                    mesaj = insider_mesaj_olustur(b)
+                    # AI analizi ekle
+                    ai_yorum_metni = insider_ai_analiz(b)
+                    if ai_yorum_metni:
+                        mesaj += f"\n\n🤖 *AI Yorumu:*\n_{ai_yorum_metni}_"
+                    telegram_gonder(mesaj)
+                    time.sleep(2)
+        except:
+            pass
+        time.sleep(900)  # 15 dakika
+
+@app.route("/insider")
+def insider():
+    """Son insider işlemleri"""
+    bildirimler = insider_bildirimleri_cek()
+    if not bildirimler:
+        return jsonify({"mesaj": "Insider işlem bulunamadı veya KAP'a erişilemedi"})
+    sonuc = []
+    for b in bildirimler[:20]:
+        baslik = b.get("title", b.get("subject", ""))
+        baslik_upper = baslik.upper()
+        if any(k in baslik_upper for k in ["ALIM", "EDİNİM"]):
+            islem = "ALIM 🟢"
+        elif any(k in baslik_upper for k in ["SATIM", "SATTI"]):
+            islem = "SATIM 🔴"
+        else:
+            islem = "DİĞER"
+        sonuc.append({
+            "id": b.get("id", ""),
+            "hisse": b.get("stockCodes", []),
+            "baslik": baslik[:200],
+            "tip": b.get("disclosureType", ""),
+            "tarih": b.get("publishDate", ""),
+            "islem_turu": islem
+        })
+    return jsonify({"toplam": len(sonuc), "insider_islemler": sonuc})
+
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
     t2=threading.Thread(target=arka_plan_kap, daemon=True)
     t3=threading.Thread(target=arka_plan_sektor, daemon=True)
     t4=threading.Thread(target=arka_plan_liste_guncelle, daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start()
+    t5=threading.Thread(target=arka_plan_insider, daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start(); t5.start()
 
 if __name__=="__main__":
     baslat()
