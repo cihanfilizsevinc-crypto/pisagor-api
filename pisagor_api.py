@@ -28,6 +28,8 @@ insider_goruldu = set()
 insider_lock = threading.Lock()
 akilli_para_cache = {"sonuc": [], "guncelleme": None}
 akilli_para_lock = threading.Lock()
+korku_cache = {"endeks": None, "seviye": None, "guncelleme": None}
+korku_lock = threading.Lock()
 sektor_cache = {"sonuc": None, "guncelleme": None}
 sektor_lock = threading.Lock()
 korelasyon_cache = {}
@@ -659,7 +661,7 @@ def anasayfa():
     with sektor_lock:
         sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"15.0",
+        "sistem":"Pisagor PRO API","versiyon":"16.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
         "sektor_guncelleme":sg,
@@ -1182,6 +1184,256 @@ def akilli_para():
         "tespitler": sonuc
     })
 
+# ─── PİYASA KORKU ENDEKSİ ────────────────────────────────────────────
+def korku_verisi_cek():
+    """Korku endeksi için veri kaynaklarını çek"""
+    veriler = {}
+
+    # 1. BIST100 volatilitesi
+    try:
+        bist = yf.Ticker("XU100.IS")
+        df = bist.history(period="2mo", interval="1d")
+        if df is not None and len(df) > 20:
+            close = df["Close"].dropna()
+            gunluk_getiri = close.pct_change().dropna()
+            volatilite = float(gunluk_getiri.tail(20).std() * np.sqrt(252) * 100)
+            son_getiri = float((close.iloc[-1] / close.iloc[-5] - 1) * 100)
+            veriler["bist_volatilite"] = round(volatilite, 2)
+            veriler["bist_haftalik"] = round(son_getiri, 2)
+            veriler["bist_deger"] = round(float(close.iloc[-1]), 0)
+    except:
+        pass
+
+    # 2. Dolar/TL volatilitesi
+    try:
+        usdtry = yf.Ticker("USDTRY=X")
+        df = usdtry.history(period="2mo", interval="1d")
+        if df is not None and len(df) > 10:
+            close = df["Close"].dropna()
+            volatilite = float(close.pct_change().tail(20).std() * np.sqrt(252) * 100)
+            son_kur = float(close.iloc[-1])
+            haftalik = float((close.iloc[-1] / close.iloc[-5] - 1) * 100)
+            veriler["usdtry"] = round(son_kur, 2)
+            veriler["usdtry_volatilite"] = round(volatilite, 2)
+            veriler["usdtry_haftalik"] = round(haftalik, 2)
+    except:
+        pass
+
+    # 3. Altın fiyatı
+    try:
+        altin = yf.Ticker("GC=F")
+        df = altin.history(period="1mo", interval="1d")
+        if df is not None and len(df) > 5:
+            close = df["Close"].dropna()
+            haftalik = float((close.iloc[-1] / close.iloc[-5] - 1) * 100)
+            veriler["altin_usd"] = round(float(close.iloc[-1]), 0)
+            veriler["altin_haftalik"] = round(haftalik, 2)
+    except:
+        pass
+
+    # 4. VIX (küresel korku)
+    try:
+        vix = yf.Ticker("^VIX")
+        df = vix.history(period="5d", interval="1d")
+        if df is not None and len(df) > 0:
+            veriler["vix"] = round(float(df["Close"].iloc[-1]), 1)
+    except:
+        pass
+
+    # 5. Türkiye CDS (5Y) — USD bazlı
+    try:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/TUR?range=5d&interval=1d",
+            headers=headers, timeout=10
+        )
+        if r.status_code == 200:
+            data = r.json()
+            result = data["chart"]["result"][0]
+            close = result["indicators"]["quote"][0]["close"]
+            veriler["tur_etf"] = round(float([x for x in close if x][-1]), 2)
+    except:
+        pass
+
+    return veriler
+
+def korku_endeksi_hesapla(veriler):
+    """0-100 arası korku endeksi hesapla"""
+    if not veriler:
+        return None
+
+    puan = 50  # Başlangıç nötr
+    bilesenler = {}
+
+    # 1. BIST volatilitesi (max 25 puan)
+    if "bist_volatilite" in veriler:
+        v = veriler["bist_volatilite"]
+        if v > 40:   b = 25
+        elif v > 30: b = 20
+        elif v > 20: b = 12
+        elif v > 15: b = 6
+        else:        b = 0
+        puan += b - 12  # Normalize
+        bilesenler["bist_volatilite"] = {"deger": v, "puan": b}
+
+    # 2. Dolar/TL haftalık değişim (max 25 puan)
+    if "usdtry_haftalik" in veriler:
+        k = veriler["usdtry_haftalik"]
+        if k > 3:    b = 25
+        elif k > 2:  b = 18
+        elif k > 1:  b = 10
+        elif k > 0:  b = 5
+        else:        b = 0
+        puan += b - 10
+        bilesenler["kur_hareketi"] = {"deger": k, "puan": b}
+
+    # 3. VIX etkisi (max 15 puan)
+    if "vix" in veriler:
+        v = veriler["vix"]
+        if v > 35:   b = 15
+        elif v > 25: b = 10
+        elif v > 20: b = 6
+        elif v > 15: b = 3
+        else:        b = 0
+        puan += b - 5
+        bilesenler["vix"] = {"deger": v, "puan": b}
+
+    # 4. Altın talebi (yükselen altın = korku)
+    if "altin_haftalik" in veriler:
+        a = veriler["altin_haftalik"]
+        if a > 2:    b = 10
+        elif a > 1:  b = 5
+        elif a < -2: b = -5
+        else:        b = 0
+        puan += b
+        bilesenler["altin"] = {"deger": a, "puan": b}
+
+    # 5. BIST haftalık performans (düşen BIST = korku)
+    if "bist_haftalik" in veriler:
+        p = veriler["bist_haftalik"]
+        if p < -5:   b = 15
+        elif p < -3: b = 10
+        elif p < -1: b = 5
+        elif p > 3:  b = -10
+        elif p > 1:  b = -5
+        else:        b = 0
+        puan += b
+        bilesenler["bist_performans"] = {"deger": p, "puan": b}
+
+    # 0-100 arası sınırla
+    puan = max(0, min(100, puan))
+
+    # Seviye belirle
+    if puan >= 75:
+        seviye = "AŞIRI KORKU"
+        emoji = "😱"
+        renk = "🔴"
+    elif puan >= 55:
+        seviye = "KORKU"
+        emoji = "😰"
+        renk = "🟠"
+    elif puan >= 45:
+        seviye = "NÖTR"
+        emoji = "😐"
+        renk = "🟡"
+    elif puan >= 25:
+        seviye = "AÇGÖZLÜLÜK"
+        emoji = "😏"
+        renk = "🟢"
+    else:
+        seviye = "AŞIRI AÇGÖZLÜLÜK"
+        emoji = "🤑"
+        renk = "💚"
+
+    return {
+        "endeks": round(puan, 1),
+        "seviye": seviye,
+        "emoji": emoji,
+        "renk": renk,
+        "bilesenler": bilesenler,
+        "veriler": veriler,
+        "tarih": datetime.now().strftime("%Y-%m-%d %H:%M")
+    }
+
+def korku_telegram_mesaj(sonuc):
+    """Korku endeksi Telegram mesajı"""
+    if not sonuc:
+        return None
+
+    e = sonuc["endeks"]
+    bar_dolu = int(e / 10)
+    bar = "█" * bar_dolu + "░" * (10 - bar_dolu)
+
+    mesaj = f"""{sonuc['renk']} *PİYASA KORKU ENDEKSİ* {sonuc['emoji']}
+_{sonuc['tarih']}_
+
+📊 Endeks: *{e}/100*
+`{bar}`
+🎯 Seviye: *{sonuc['seviye']}*
+
+📈 *Bileşenler:*"""
+
+    v = sonuc.get("veriler", {})
+    if "bist_deger" in v:
+        haftalik = v.get("bist_haftalik", 0)
+        mesaj += f"\n• BIST100: {v['bist_deger']:,.0f} ({haftalik:+.1f}% hafta)"
+    if "usdtry" in v:
+        mesaj += f"\n• USD/TL: {v['usdtry']} ({v.get('usdtry_haftalik', 0):+.1f}% hafta)"
+    if "altin_usd" in v:
+        mesaj += f"\n• Altın: ${v['altin_usd']:,.0f} ({v.get('altin_haftalik', 0):+.1f}% hafta)"
+    if "vix" in v:
+        mesaj += f"\n• VIX (Küresel Korku): {v['vix']}"
+    if "bist_volatilite" in v:
+        mesaj += f"\n• BIST Volatilite: %{v['bist_volatilite']:.1f}"
+
+    # Yorum
+    if e >= 75:
+        mesaj += "\n\n💡 _Tarihsel olarak aşırı korku dönemleri alım fırsatı yaratabilir._"
+    elif e >= 55:
+        mesaj += "\n\n💡 _Piyasada temkinli yaklaşım öneriliyor._"
+    elif e <= 25:
+        mesaj += "\n\n💡 _Aşırı iyimserlik dönemlerinde dikkatli olunmalı._"
+
+    mesaj += "\n\n⚠️ _Yatırım tavsiyesi değildir._"
+    return mesaj
+
+def arka_plan_korku():
+    """Her saat başı korku endeksini güncelle"""
+    time.sleep(120)
+    while True:
+        try:
+            veriler = korku_verisi_cek()
+            sonuc = korku_endeksi_hesapla(veriler)
+            if sonuc:
+                with korku_lock:
+                    korku_cache["endeks"] = sonuc["endeks"]
+                    korku_cache["seviye"] = sonuc["seviye"]
+                    korku_cache["guncelleme"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    korku_cache["detay"] = sonuc
+
+                # Her 4 saatte bir Telegram'a gönder
+                mesaj = korku_telegram_mesaj(sonuc)
+                if mesaj:
+                    telegram_gonder(mesaj)
+        except:
+            pass
+        time.sleep(14400)  # 4 saat
+
+@app.route("/korku")
+def korku():
+    """Piyasa korku endeksi"""
+    with korku_lock:
+        detay = korku_cache.get("detay")
+
+    if not detay:
+        # Anlık hesapla
+        veriler = korku_verisi_cek()
+        detay = korku_endeksi_hesapla(veriler)
+        if not detay:
+            return jsonify({"mesaj": "Korku endeksi hesaplanamadı"})
+
+    return jsonify(detay)
+
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
@@ -1190,7 +1442,8 @@ def baslat():
     t4=threading.Thread(target=arka_plan_liste_guncelle, daemon=True)
     t5=threading.Thread(target=arka_plan_insider, daemon=True)
     t6=threading.Thread(target=arka_plan_akilli_para, daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start(); t5.start(); t6.start()
+    t7=threading.Thread(target=arka_plan_korku, daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start(); t5.start(); t6.start(); t7.start()
 
 if __name__=="__main__":
     baslat()
