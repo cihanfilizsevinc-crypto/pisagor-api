@@ -26,6 +26,8 @@ liste_cache = {"hisseler": None, "guncelleme": None}
 liste_lock = threading.Lock()
 insider_goruldu = set()
 insider_lock = threading.Lock()
+akilli_para_cache = {"sonuc": [], "guncelleme": None}
+akilli_para_lock = threading.Lock()
 sektor_cache = {"sonuc": None, "guncelleme": None}
 sektor_lock = threading.Lock()
 korelasyon_cache = {}
@@ -657,7 +659,7 @@ def anasayfa():
     with sektor_lock:
         sg=sektor_cache.get("guncelleme","Henüz hesaplanmadı")
     return jsonify({
-        "sistem":"Pisagor PRO API","versiyon":"14.0",
+        "sistem":"Pisagor PRO API","versiyon":"15.0",
         "toplam_hisse":len(BIST_TUMU),
         "tarama_durumu":d,"taranan":f"{t}/{top}","son_guncelleme":g,
         "sektor_guncelleme":sg,
@@ -1024,6 +1026,162 @@ def insider():
         })
     return jsonify({"toplam": len(sonuc), "insider_islemler": sonuc})
 
+# ─── AKILLI PARA TAKİBİ ───────────────────────────────────────────────
+def akilli_para_analiz(ticker, df):
+    """Hacim anomalisi ve akıllı para hareketini tespit et"""
+    try:
+        close  = df["close"].squeeze().astype(float)
+        volume = df["volume"].squeeze().astype(float)
+        high   = df["high"].squeeze().astype(float)
+        low    = df["low"].squeeze().astype(float)
+
+        if len(df) < 20:
+            return None
+
+        # Son günün verileri
+        son_hacim    = float(volume.iloc[-1])
+        ort_hacim    = float(volume.rolling(20).mean().iloc[-1])
+        son_fiyat    = float(close.iloc[-1])
+        onceki_fiyat = float(close.iloc[-2])
+        son_yuzde    = (son_fiyat / onceki_fiyat - 1) * 100
+
+        # Hacim çarpanı
+        hacim_carpan = son_hacim / ort_hacim if ort_hacim > 0 else 0
+
+        # Fiyat aralığı (volatilite)
+        son_aralik = float((high.iloc[-1] - low.iloc[-1]) / close.iloc[-1] * 100)
+        ort_aralik = float(((high - low) / close * 100).rolling(20).mean().iloc[-1])
+
+        # Akıllı para kriterleri:
+        # 1. Hacim normalin 3x+ üzerinde
+        # 2. Fiyat değişimi küçük (gizli birikim) VEYA büyük (kırılım)
+        # 3. Gün içi aralık normal seviyede
+
+        sinyal = None
+        guc = 0
+
+        # Gizli Birikim: Yüksek hacim + küçük fiyat hareketi
+        if hacim_carpan >= 3 and abs(son_yuzde) < 2:
+            sinyal = "GİZLİ BİRİKİM"
+            guc = min(int(hacim_carpan), 5)
+
+        # Güçlü Kırılım: Yüksek hacim + büyük fiyat artışı
+        elif hacim_carpan >= 2.5 and son_yuzde > 3:
+            sinyal = "GÜÇLÜ YUKARI KIRILIM"
+            guc = min(int(hacim_carpan), 5)
+
+        # Güçlü Düşüş: Yüksek hacim + büyük fiyat düşüşü
+        elif hacim_carpan >= 2.5 and son_yuzde < -3:
+            sinyal = "GÜÇLÜ AŞAĞI KIRILIM"
+            guc = min(int(hacim_carpan), 5)
+
+        # Kurumsal Alım: Çok yüksek hacim + pozitif kapanış
+        elif hacim_carpan >= 5 and son_yuzde > 0:
+            sinyal = "KURUMSAL ALIM ŞÜPHESİ"
+            guc = 5
+
+        if not sinyal:
+            return None
+
+        return {
+            "hisse": ticker.replace(".IS", ""),
+            "sinyal": sinyal,
+            "guc": guc,
+            "yildiz": "★" * guc + "☆" * (5-guc),
+            "fiyat": round(son_fiyat, 2),
+            "fiyat_degisim": round(son_yuzde, 2),
+            "hacim": int(son_hacim),
+            "ort_hacim": int(ort_hacim),
+            "hacim_carpan": round(hacim_carpan, 1),
+            "tarih": str(df.index[-1].date())
+        }
+    except:
+        return None
+
+def akilli_para_telegram_mesaj(sinyal):
+    """Akıllı para sinyali için Telegram mesajı"""
+    s = sinyal["sinyal"]
+    if "BİRİKİM" in s:
+        emoji = "🐋"
+        aciklama = "Büyük yatırımcılar sessizce pozisyon alıyor olabilir!"
+    elif "YUKARI" in s:
+        emoji = "🚀"
+        aciklama = "Güçlü alım baskısı ile fiyat kırılımı gerçekleşti!"
+    elif "AŞAĞI" in s:
+        emoji = "📉"
+        aciklama = "Güçlü satış baskısı ile sert düşüş yaşandı!"
+    elif "KURUMSAL" in s:
+        emoji = "🏦"
+        aciklama = "Olağandışı hacim — kurumsal yatırımcı hareketi şüphesi!"
+    else:
+        emoji = "👁️"
+        aciklama = "Olağandışı hacim tespit edildi."
+
+    mesaj = f"""{emoji} *AKILLI PARA TESPİTİ*
+{sinyal['yildiz']}
+
+🏢 *{sinyal['hisse']}* — {sinyal['sinyal']}
+💰 Fiyat: {sinyal['fiyat']}₺ ({sinyal['fiyat_degisim']:+.2f}%)
+
+📊 *Hacim Analizi*
+• Günlük Hacim: {sinyal['hacim']:,}
+• Ortalama Hacim: {sinyal['ort_hacim']:,}
+• Hacim Çarpanı: *{sinyal['hacim_carpan']}x* ‼️
+
+💡 _{aciklama}_
+
+⚠️ _Teknik gösterge bilgisidir, yatırım tavsiyesi değildir._"""
+    return mesaj
+
+def arka_plan_akilli_para():
+    """Her saat başı akıllı para hareketlerini tara"""
+    time.sleep(90)  # 90 saniye bekle
+    while True:
+        try:
+            tespitler = []
+            liste = guncel_liste()
+            # Sadece likit hisseleri tara (BIST100 benzeri)
+            taranacak = liste[:200]
+
+            for h in taranacak:
+                try:
+                    ticker = h + ".IS"
+                    df = veri_cek(ticker)
+                    if df is not None and len(df) > 20:
+                        sonuc = akilli_para_analiz(ticker, df)
+                        if sonuc:
+                            tespitler.append(sonuc)
+                            # Telegram'a gönder
+                            mesaj = akilli_para_telegram_mesaj(sonuc)
+                            telegram_gonder(mesaj)
+                            time.sleep(1)
+                    time.sleep(0.3)
+                except:
+                    pass
+
+            tespitler.sort(key=lambda x: x["hacim_carpan"], reverse=True)
+            with akilli_para_lock:
+                akilli_para_cache["sonuc"] = tespitler
+                akilli_para_cache["guncelleme"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        except:
+            pass
+        time.sleep(3600)  # 1 saat
+
+@app.route("/akilli-para")
+def akilli_para():
+    """Son akıllı para tespitleri"""
+    with akilli_para_lock:
+        sonuc = akilli_para_cache["sonuc"]
+        guncelleme = akilli_para_cache["guncelleme"]
+    if not sonuc:
+        return jsonify({"mesaj": "Henüz analiz tamamlanmadı, ~1 saat sonra tekrar dene"})
+    return jsonify({
+        "guncelleme": guncelleme,
+        "tespit_sayisi": len(sonuc),
+        "tespitler": sonuc
+    })
+
 # ─── BAŞLANGIÇ ────────────────────────────────────────────────────────
 def baslat():
     t1=threading.Thread(target=arka_plan_tara, daemon=True)
@@ -1031,7 +1189,8 @@ def baslat():
     t3=threading.Thread(target=arka_plan_sektor, daemon=True)
     t4=threading.Thread(target=arka_plan_liste_guncelle, daemon=True)
     t5=threading.Thread(target=arka_plan_insider, daemon=True)
-    t1.start(); t2.start(); t3.start(); t4.start(); t5.start()
+    t6=threading.Thread(target=arka_plan_akilli_para, daemon=True)
+    t1.start(); t2.start(); t3.start(); t4.start(); t5.start(); t6.start()
 
 if __name__=="__main__":
     baslat()
