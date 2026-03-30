@@ -655,7 +655,7 @@ def arka_plan_tara():
             cache["sonuc"]=sinyaller
             cache["guncelleme"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             cache["durum"]="tamamlandi"; cache["taranan"]=len(BIST_TUMU)
-        time.sleep(7200)
+        time.sleep(1800)
 
 # ─── ENDPOINT'LER ─────────────────────────────────────────────────────
 @app.route("/")
