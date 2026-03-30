@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -13,6 +14,7 @@ import re
 import io
 
 app = Flask(__name__)
+CORS(app, origins=os.environ.get('CORS_ORIGINS', '*'))
 
 # ─── GLOBAL CACHE ─────────────────────────────────────────────────────
 cache = {
