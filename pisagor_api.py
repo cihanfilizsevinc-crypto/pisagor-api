@@ -465,8 +465,8 @@ def analiz_et(ticker, lookback=50):
     macd_bull=macd_line>macd_sig; macd_bear=macd_line<macd_sig
     cross_up_mid=(close>b_md)&(close.shift()<=b_md.shift()); cross_dn_mid=(close<b_mu)&(close.shift()>=b_mu.shift())
     cross_up_lower=(close>b_lo)&(close.shift()<=b_lo.shift()); cross_dn_upper=(close<b_up)&(close.shift()>=b_up.shift())
-    al_sinyal=cross_up_mid&trend_up&rsi_al&adx_ok&vol_ok&di_bull&macd_bull
-    sat_sinyal=cross_dn_mid&trend_down&rsi_sat&adx_ok&vol_ok&di_bear&macd_bear
+    al_sinyal=cross_up_mid&trend_up&rsi_al&adx_ok&vol_ok&di_bull
+    sat_sinyal=cross_dn_mid&trend_down&rsi_sat&adx_ok&vol_ok&di_bear
     guclu_al=cross_up_lower&trend_up&(rsi<50)&adx_ok&vol_ok&di_bull&macd_bull
     guclu_sat=cross_dn_upper&trend_down&(rsi>55)&adx_ok&vol_ok&di_bear&macd_bear
     s=-1
